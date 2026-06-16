@@ -1,0 +1,97 @@
+# ===== 依赖目录 =====
+node_modules/
+bower_components/
+jspm_packages/
+.pnp/
+.yarn/
+vendor/
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+# ===== 前端框架构建缓存 =====
+.next/
+.nuxt/
+.svelte-kit/
+.astro/
+.turbo/
+.parcel-cache/
+.vite/
+.expo/
+.docusaurus/
+coverage/
+.nyc_output/
+# ===== 构建 / 输出产物 =====
+dist/
+build/
+out/
+target/
+bin/
+obj/
+*.class
+*.o
+*.so
+*.dll
+*.dylib
+*.exe
+*.pdb
+*.node
+# ===== 桌面应用打包产物（Electron / Tauri 等，动辄上百 MB，会触发 GitHub 100MB 限制）=====
+release/
+releases/
+dist_electron/
+dist-electron/
+app-builds/
+src-tauri/target/
+*.asar
+*.dmg
+*.pkg
+*.msi
+*.msix
+*.appx
+*.AppImage
+*.deb
+*.rpm
+*.snap
+*.blockmap
+# ===== 大体积压缩 / 镜像文件 =====
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.rar
+*.iso
+# ===== 日志 / 临时文件 =====
+*.log
+logs/
+tmp/
+temp/
+.cache/
+*.tmp
+*.bak
+*.swp
+# ===== 环境变量 / 密钥 =====
+.env
+.env.*
+!.env.example
+*.local
+secrets.*
+# ===== IDE / 编辑器 =====
+.idea/
+.vscode/
+*.iml
+*.sublime-*
+# ===== 操作系统 =====
+.DS_Store
+Thumbs.db
+desktop.ini
