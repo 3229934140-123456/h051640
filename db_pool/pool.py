@@ -36,11 +36,15 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator, Optional, TYPE_CHECKING
 
+from .connection import ConnectionReturnedError, PooledConnection
 from .connection_factory import ConnectionFactory
 from .pool_manager import PoolManager, PoolStats
 from .borrow_return import BorrowReturn, GetTimeoutError, PoolClosedError
 from .health_check import HealthChecker
 from .leak_detector import LeakDetector, LeakInfo, LeakListener
+from .retry import RetryPolicy
+from .shutdown_state import ShutdownInfo, ShutdownPhase, ShutdownState
+from .metrics import stats_to_dict, stats_to_json, stats_to_prometheus
 
 
 if TYPE_CHECKING:
@@ -85,6 +89,12 @@ class PoolConfig:
         ping_fn:              自定义探活函数,参数为底层连接
         reset_fn:             自定义归还重置函数
         destroy_fn:           自定义关闭函数
+
+    重试策略 (可选):
+        retry_policy:         创建/探活/重置失败的重试策略,None=默认无重试
+
+    可观测性:
+        pool_name:            池名称,用于 Prometheus 标签区分多个池
     """
     min_size: int = 5
     max_size: int = 30
@@ -109,6 +119,9 @@ class PoolConfig:
     ping_fn: Optional[Callable[[Any], None]] = None
     reset_fn: Optional[Callable[[Any], None]] = None
     destroy_fn: Optional[Callable[[Any], None]] = None
+
+    retry_policy: Optional[RetryPolicy] = None
+    pool_name: str = "default"
 
 
 # --------------------------------------------------------------------------- 主类
@@ -135,6 +148,18 @@ class ConnectionPool:
             config = PoolConfig()
         self._config = config
 
+        # 统计回调,供 ConnectionFactory 上报失败和重试
+        # 签名: (event: str, attempts: int, delay: float)
+        def _stats_callback(event: str, attempts: int, delay: float) -> None:
+            if event == "create_fail":
+                self._manager.inc_create_failure()
+            elif event == "ping_fail":
+                self._manager.inc_ping_failure()
+            elif event == "reset_fail":
+                self._manager.inc_reset_failure()
+            elif event == "retried":
+                self._manager.inc_retried(attempts)
+
         if factory is None:
             if create_fn is None:
                 raise ValueError("Either create_fn or factory must be provided")
@@ -143,10 +168,15 @@ class ConnectionPool:
                 ping_fn=config.ping_fn,
                 reset_fn=config.reset_fn,
                 destroy_fn=config.destroy_fn,
+                retry_policy=config.retry_policy,
+                stats_callback=_stats_callback,
             )
         elif create_fn is not None:
             raise ValueError("create_fn and factory are mutually exclusive")
         self._factory = factory
+
+        # 关闭状态机
+        self._shutdown_state = ShutdownState()
 
         self._manager = PoolManager(
             self._factory,
@@ -278,6 +308,36 @@ class ConnectionPool:
         """获取当前运行统计快照。"""
         return self._manager.snapshot_stats(waiting=self._borrow.waiting_count)
 
+    # ---------------------------------------------------------- 可观测性接口
+
+    def get_stats_dict(self) -> dict:
+        """获取 dict 形式的统计指标,方便日志采集。"""
+        return stats_to_dict(
+            self.stats(),
+            pool_name=self._config.pool_name,
+        )
+
+    def get_stats_json(self, indent: int = 2) -> str:
+        """获取 JSON 字符串形式的统计指标。"""
+        return stats_to_json(
+            self.stats(),
+            pool_name=self._config.pool_name,
+            indent=indent,
+        )
+
+    def get_prometheus_metrics(self) -> str:
+        """获取 Prometheus exposition format 指标,可直接挂 /metrics 端点。"""
+        return stats_to_prometheus(
+            self.stats(),
+            pool_name=self._config.pool_name,
+        )
+
+    def get_shutdown_info(self) -> ShutdownInfo:
+        """获取关闭过程的状态快照,方便停机时判断是否卡住。"""
+        return self._shutdown_state.snapshot(
+            borrowed_count=self._manager.borrowed_count,
+        )
+
     # ---------------------------------------------------------- 关闭
 
     def close(
@@ -302,28 +362,47 @@ class ConnectionPool:
         logger.info("Closing connection pool (graceful=%s, wait=%s, force=%s)",
                     graceful, wait_timeout, force)
 
-        # 1) 停止后台线程
+        # 阶段 1: 停止后台线程
+        self._shutdown_state.set_phase(ShutdownPhase.STOPPING_BACKGROUND)
         if self._health is not None:
             self._health.stop()
         if self._leak is not None:
             self._leak.stop()
 
-        # 2) 标记池关闭,新的 borrow 直接抛错
+        # 阶段 2: 标记池关闭,新的 borrow 直接抛错
         self._manager.begin_shutdown()
 
-        # 3) 优雅等待在用连接归还
+        # 阶段 3: 优雅等待在用连接归还
+        outstanding_ids: list[int] = []
         if graceful and not force:
-            ok = self._borrow.wait_until_all_returned(timeout=wait_timeout)
+            self._shutdown_state.set_phase(ShutdownPhase.BEGIN_GRACEFUL_WAIT)
+            self._shutdown_state.set_graceful_deadline(wait_timeout)
+            ok, outstanding_ids = self._borrow.wait_until_all_returned(
+                timeout=wait_timeout,
+            )
             if not ok:
+                self._shutdown_state.set_phase(ShutdownPhase.GRACEFUL_WAIT_TIMEOUT)
+                # 保存未归还的连接 ID 到状态机
+                self._shutdown_state.set_outstanding_conn_ids(outstanding_ids)
                 logger.warning(
                     "Graceful wait timed out after %.1fs, %d connections still borrowed, "
                     "will force-close them",
                     wait_timeout, self._manager.borrowed_count,
                 )
 
-        # 4) 销毁剩余所有连接
+        # 阶段 4: 销毁剩余所有连接
+        self._shutdown_state.set_phase(ShutdownPhase.FORCE_DESTROY)
         destroyed = self._manager.force_destroy_all()
+        self._shutdown_state.inc_force_destroyed(destroyed)
         logger.info("Connection pool closed, %d connections destroyed", destroyed)
+
+        # 阶段 5: 完成
+        self._shutdown_state.set_phase(ShutdownPhase.SHUTDOWN_COMPLETE)
+        # 最终快照保存未归还的连接 ID
+        _ = self._shutdown_state.snapshot(
+            borrowed_count=0,
+            outstanding_conn_ids=outstanding_ids,
+        )
 
     # ---------------------------------------------------------- 上下文
 

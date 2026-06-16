@@ -9,10 +9,41 @@
 - health_check: 健康检查,空闲连接探活
 - leak_detector: 泄漏检测,长时间未归还连接告警
 - pool: 对外主入口 ConnectionPool
+- retry: 重试策略 (指数退避 + 抖动)
+- shutdown_state: 关闭状态机 (可观测停机流程)
+- metrics: 指标导出 (dict/JSON/Prometheus)
+- time_window_stats: 滑动窗口统计 (avg/p99/max 耗时)
 """
 
 from .pool import ConnectionPool, PoolConfig
-from .connection import PooledConnection
+from .connection import PooledConnection, ConnectionReturnedError
+from .connection_factory import ConnectionFactory
+from .pool_manager import PoolStats
+from .borrow_return import GetTimeoutError, PoolClosedError
+from .leak_detector import LeakInfo, LeakListener
+from .retry import RetryPolicy, RetryOutcome, NO_RETRY
+from .shutdown_state import ShutdownInfo, ShutdownPhase, ShutdownState
+from .metrics import stats_to_dict, stats_to_json, stats_to_prometheus
 
-__all__ = ["ConnectionPool", "PoolConfig", "PooledConnection"]
-__version__ = "1.0.0"
+__all__ = [
+    "ConnectionPool",
+    "PoolConfig",
+    "PooledConnection",
+    "ConnectionFactory",
+    "PoolStats",
+    "GetTimeoutError",
+    "PoolClosedError",
+    "ConnectionReturnedError",
+    "LeakInfo",
+    "LeakListener",
+    "RetryPolicy",
+    "RetryOutcome",
+    "NO_RETRY",
+    "ShutdownInfo",
+    "ShutdownPhase",
+    "ShutdownState",
+    "stats_to_dict",
+    "stats_to_json",
+    "stats_to_prometheus",
+]
+__version__ = "2.0.0"

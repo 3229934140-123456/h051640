@@ -95,3 +95,31 @@ secrets.*
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# >>> auto_trae 大文件兜底忽略（自动追加，勿删）>>>
+release/
+releases/
+dist_electron/
+dist-electron/
+app-builds/
+src-tauri/target/
+node_modules/
+*.asar
+*.dmg
+*.pkg
+*.msi
+*.msix
+*.appx
+*.AppImage
+*.deb
+*.rpm
+*.snap
+*.blockmap
+*.exe
+*.dll
+*.dylib
+*.node
+*.zip
+*.7z
+*.iso
+# <<< auto_trae 大文件兜底忽略 <<<

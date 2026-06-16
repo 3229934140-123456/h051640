@@ -133,18 +133,24 @@ class HealthChecker:
             if self._stop_evt.is_set():
                 break
             # 先 double-check: 连接在我们 ping 之前可能已经被借走了
-            # 做法: 尝试从 idle 中 remove,成功才是我们的
-            if not self._manager.remove_idle(c):
+            # 用 mark_health_check_take 从 idle 中取出,同时计入 in_health_check,
+            # 这样 total 计数始终包含这部分连接,不会突破 max_size
+            if not self._manager.mark_health_check_take(c):
                 continue
-            if self._factory.ping(c):
-                c.touch_checked()
-                self._manager.add_idle(c)
-            else:
-                logger.info(
-                    "Connection id=%s is dead (idle for %.0fs, age %.0fs), removing",
-                    c.conn_id, c.idle_seconds, c.age_seconds,
-                )
-                self._manager.destroy_connection(c)
+            try:
+                if self._factory.ping(c):
+                    c.touch_checked()
+                    self._manager.mark_health_check_return(c, still_alive=True)
+                else:
+                    logger.info(
+                        "Connection id=%s is dead (idle for %.0fs, age %.0fs), removing",
+                        c.conn_id, c.idle_seconds, c.age_seconds,
+                    )
+                    self._manager.mark_health_check_return(c, still_alive=False)
+                    dead += 1
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Health check ping failed for conn#%d: %s", c.conn_id, exc)
+                self._manager.mark_health_check_return(c, still_alive=False)
                 dead += 1
 
         # 4) 缩容

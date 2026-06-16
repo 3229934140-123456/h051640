@@ -23,6 +23,7 @@ from typing import Deque, Dict, Optional
 
 from .connection import PooledConnection
 from .connection_factory import ConnectionFactory
+from .time_window_stats import TimeWindowStats
 
 
 logger = logging.getLogger("db_pool.manager")
@@ -43,6 +44,21 @@ class PoolStats:
     timeouts: int = 0
     leaked: int = 0
 
+    # --- 新增: 失败计数
+    create_failures: int = 0
+    ping_failures: int = 0
+    reset_failures: int = 0
+    retried_operations: int = 0
+
+    # --- 新增: 并发状态量
+    pending_creates: int = 0
+    in_health_check: int = 0
+
+    # --- 新增: 等待耗时 (滑动窗口)
+    avg_wait_seconds: float = 0.0
+    p99_wait_seconds: float = 0.0
+    max_wait_seconds: float = 0.0
+
 
 class PoolManager:
     """
@@ -52,6 +68,9 @@ class PoolManager:
     - 空闲集合使用 deque,按 LIFO 取最近用过的(更可能还活着),FIFO 归还。
     - 提供 pop_idle / add_idle / register_borrowed / unregister_borrowed 等原语,
       由借还逻辑模块组合使用。
+    - 健康检查移走的空闲连接做探活时,会占用 _in_health_check 计数,使得
+      total_count = idle + borrowed + in_health_check,
+      从而守住 max_size 不被突破。
     """
 
     def __init__(
@@ -83,6 +102,12 @@ class PoolManager:
         self._stats = PoolStats(min_size=min_size, max_size=max_size)
         self._shutdown = False
 
+        # 健康检查从 idle 移走的连接数 (用于计算 total 时要加上,守住 max_size
+        self._in_health_check: int = 0
+
+        # 等待耗时统计 (滑动窗口 60s / 2000 样本
+        self._wait_stats = TimeWindowStats(window_seconds=60.0, max_samples=2000)
+
     # ---------------------------------------------------------- 基础属性
 
     @property
@@ -99,8 +124,9 @@ class PoolManager:
 
     @property
     def total_count(self) -> int:
+        """总连接数 = 空闲 + 已借出 + 健康检查正在探活的。"""
         with self._lock:
-            return len(self._idle) + len(self._borrowed)
+            return len(self._idle) + len(self._borrowed) + self._in_health_check
 
     @property
     def idle_count(self) -> int:
@@ -113,9 +139,17 @@ class PoolManager:
             return len(self._borrowed)
 
     @property
-    def can_create_more(self) -> bool:
+    def in_health_check_count(self) -> int:
         with self._lock:
-            return (len(self._idle) + len(self._borrowed)) < self._max_size
+            return self._in_health_check
+
+    @property
+    def can_create_more(self) -> bool:
+        """创建名额是否还有?考虑 idle+borrowed+in_health_check 都不能超过 max_size。
+        """
+        with self._lock:
+            total = len(self._idle) + len(self._borrowed) + self._in_health_check
+            return total < self._max_size
 
     # ---------------------------------------------------------- 初始化预热
 
@@ -132,6 +166,7 @@ class PoolManager:
                 conn = self._factory.create(self._pool_ref)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Pre-create connection failed: %s", exc)
+                # 注意: create_failures 由 ConnectionFactory 通过 stats_callback 报告
                 continue
             with self._lock:
                 self._idle.append(conn)
@@ -170,6 +205,31 @@ class PoolManager:
             except ValueError:
                 return False
 
+    def mark_health_check_take(self, conn: PooledConnection) -> bool:
+        """
+        健康检查从 idle 中拿一个连接去探活,先从 idle 移除并计入 in_health_check。
+        返回 True 表示成功从 idle 中取出并占坑完成。
+        """
+        with self._lock:
+            try:
+                self._idle.remove(conn)
+                self._in_health_check += 1
+                return True
+            except ValueError:
+                return False
+
+    def mark_health_check_return(self, conn: PooledConnection, still_alive: bool) -> None:
+        """
+        健康检查完成,把连接要么放回 idle,要么销毁。无论哪种都要递减 in_health_check。
+        """
+        with self._lock:
+            self._in_health_check = max(0, self._in_health_check - 1)
+        if still_alive:
+            conn.touch_checked()
+            self.add_idle(conn)
+        else:
+            self.destroy_connection(conn)
+
     def replace_idle(self, bad: PooledConnection) -> Optional[PooledConnection]:
         """
         用一个新建的好连接"顶替"掉空闲/刚取出但已坏的连接。
@@ -178,13 +238,14 @@ class PoolManager:
         self._factory.destroy(bad)
         with self._lock:
             self._stats.destroyed += 1
-            total = len(self._idle) + len(self._borrowed)
+            total = len(self._idle) + len(self._borrowed) + self._in_health_check
             if total >= self._max_size:
                 return None
         try:
             new_conn = self._factory.create(self._pool_ref)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Replace bad connection failed to create new one: %s", exc)
+            # 注意: create_failures 由 ConnectionFactory 通过 stats_callback 报告
             return None
         with self._lock:
             self._stats.created += 1
@@ -216,13 +277,14 @@ class PoolManager:
         否则返回 None。
         """
         with self._lock:
-            total = len(self._idle) + len(self._borrowed)
+            total = len(self._idle) + len(self._borrowed) + self._in_health_check
             if total >= self._max_size:
                 return None
         try:
             conn = self._factory.create(self._pool_ref)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to create new connection: %s", exc)
+            # 注意: create_failures 由 ConnectionFactory 通过 stats_callback 报告
             return None
         with self._lock:
             self._stats.created += 1
@@ -277,7 +339,7 @@ class PoolManager:
         target = shrink_target if shrink_target is not None else self._min_size
         removed = 0
         with self._lock:
-            total = len(self._idle) + len(self._borrowed)
+            total = len(self._idle) + len(self._borrowed) + self._in_health_check
             if total <= target:
                 return 0
             now = time.monotonic()
@@ -298,12 +360,16 @@ class PoolManager:
 
     # ---------------------------------------------------------- 统计 & 关闭
 
-    def snapshot_stats(self, waiting: int = 0) -> PoolStats:
+    def record_wait_time(self, wait_seconds: float) -> None:
+        """记录一次等待耗时,由借还模块在拿到连接后调用。"""
+        self._wait_stats.record(wait_seconds)
+
+    def snapshot_stats(self, waiting: int = 0, pending_creates: int = 0) -> PoolStats:
         with self._lock:
             s = PoolStats(
                 min_size=self._stats.min_size,
                 max_size=self._stats.max_size,
-                total=len(self._idle) + len(self._borrowed),
+                total=len(self._idle) + len(self._borrowed) + self._in_health_check,
                 idle=len(self._idle),
                 borrowed=len(self._borrowed),
                 waiting=waiting,
@@ -312,6 +378,15 @@ class PoolManager:
                 borrowed_total=self._stats.borrowed_total,
                 timeouts=self._stats.timeouts,
                 leaked=self._stats.leaked,
+                create_failures=self._stats.create_failures,
+                ping_failures=self._stats.ping_failures,
+                reset_failures=self._stats.reset_failures,
+                retried_operations=self._stats.retried_operations,
+                pending_creates=pending_creates,
+                in_health_check=self._in_health_check,
+                avg_wait_seconds=self._wait_stats.avg(),
+                p99_wait_seconds=self._wait_stats.p99(),
+                max_wait_seconds=self._wait_stats.max(),
             )
             return s
 
@@ -322,6 +397,22 @@ class PoolManager:
     def inc_leaked(self, n: int = 1) -> None:
         with self._lock:
             self._stats.leaked += n
+
+    def inc_create_failure(self) -> None:
+        with self._lock:
+            self._stats.create_failures += 1
+
+    def inc_ping_failure(self) -> None:
+        with self._lock:
+            self._stats.ping_failures += 1
+
+    def inc_reset_failure(self) -> None:
+        with self._lock:
+            self._stats.reset_failures += 1
+
+    def inc_retried(self, n: int = 1) -> None:
+        with self._lock:
+            self._stats.retried_operations += n
 
     def acquire_lock(self) -> threading.RLock:
         """暴露锁,供借还模块做复合原子操作。"""

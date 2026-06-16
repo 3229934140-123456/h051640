@@ -18,10 +18,18 @@
     4. [锁外] ping 校验 → 失败则销毁重走 1-3
     5. [锁内] 登记 borrowed,返回连接
 
-归还流程:
+归还流程 (关键: 连接剥离设计):
     1. [锁内] 从 borrowed 注销
-    2. [锁外] factory.reset
-    3. [锁内] 入池或销毁 → notify 一个等待者
+    2. [锁外] strip_real_connection 剥离底层真实连接
+    3. [锁外] factory.reset_real 重置真实连接
+    4. [锁外] 成功 → factory.wrap_real 重新包装为新的 PooledConnection
+                失败 → factory.destroy_real 销毁真实连接
+    5. [锁内] 新包装好的连接入池 或 直接销毁 → notify_all
+
+连接剥离设计保证:
+    - 用户持有的旧 PooledConnection 引用已标记 returned=True,任何访问都会
+      抛 ConnectionReturnedError,防止连接归还后继续被误用。
+    - 底层真实连接被新的 PooledConnection 包装后可以安全复用。
 """
 
 from __future__ import annotations
@@ -89,8 +97,15 @@ class BorrowReturn:
         deadline = time.monotonic() + effective_timeout
 
         while True:
+            wait_start = time.monotonic()
+
             # --- Phase A: 锁内决定获取方式 (idle / 创建名额 / 排队) ---
             kind, candidate = self._acquire_slot_locked(deadline, effective_timeout)
+
+            # 记录等待耗时 (从进入 borrow 到拿到候选)
+            wait_time = time.monotonic() - wait_start
+            if wait_time > 0:
+                self._manager.record_wait_time(wait_time)
 
             if kind == _TAKE_CREATE:
                 # candidate is None; 我们占了创建坑,出锁去创建
@@ -99,19 +114,17 @@ class BorrowReturn:
                     # 创建失败, 释放占坑,重新循环尝试
                     with self._cond:
                         self._pending_creates -= 1
-                        self._wake_one_locked()  # 让别人试试
+                        self._wake_one_locked()
                     continue
                 candidate = new_conn
-                # 注意: 创建完成后,占坑的 _pending_creates 还要在 register_borrowed 时减去
-                # 我们在 register_borrowed_locked 里处理
 
             # --- Phase B: 锁外健康校验 (candidate 一定不是 None) ---
             if not self._validate_out_of_lock(candidate):
-                self._factory.destroy(candidate)
+                # 使用 manager.destroy_connection 确保 destroyed 统计被正确更新
+                self._manager.destroy_connection(candidate)
                 with self._cond:
                     if kind == _TAKE_CREATE:
                         self._pending_creates -= 1
-                    self._manager._stats.destroyed += 1
                     self._wake_one_locked()
                 continue
 
@@ -120,7 +133,8 @@ class BorrowReturn:
             if final is not None:
                 return final
             # final 为 None → 中途 shutdown, 销毁 candidate 继续
-            self._factory.destroy(candidate)
+            # 使用 manager.destroy_connection 确保 destroyed 统计被正确更新
+            self._manager.destroy_connection(candidate)
 
     # ------------------------------------------------------------------
     # Phase A 辅助: 锁内获取一个"坑"
@@ -144,11 +158,12 @@ class BorrowReturn:
                 if c is not None:
                     return (_TAKE_IDLE, c)
 
-                # b) 是否能创建 (total + 正在创建的 < max)?
+                # b) 是否能创建 (total + 正在创建的 + 健康检查中的 < max)?
                 total = (
                     self._manager.idle_count
                     + self._manager.borrowed_count
                     + self._pending_creates
+                    + self._manager.in_health_check_count
                 )
                 if total < self._manager._max_size:
                     self._pending_creates += 1
@@ -158,11 +173,16 @@ class BorrowReturn:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     self._manager.inc_timeout()
-                    s = self._manager.snapshot_stats(waiting=len(self._waiters))
+                    s = self._manager.snapshot_stats(
+                        waiting=len(self._waiters),
+                        pending_creates=self._pending_creates,
+                    )
                     raise GetTimeoutError(
                         f"Timed out waiting for connection after "
                         f"{original_timeout:.2f}s, "
                         f"total={s.total} idle={s.idle} borrowed={s.borrowed} "
+                        f"in_health_check={s.in_health_check} "
+                        f"pending_creates={s.pending_creates} "
                         f"waiting={s.waiting}"
                     )
 
@@ -185,15 +205,19 @@ class BorrowReturn:
             c = self._factory.create(self._manager._pool_ref)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Create connection failed: %s", exc)
+            # 注意: create_failures 由 ConnectionFactory 通过 stats_callback 报告
             return None
-        with self._lock:
+        # 增加 created 统计
+        with self._cond:
             self._manager._stats.created += 1
         return c
 
     def _validate_out_of_lock(self, c: PooledConnection) -> bool:
         if not self._test_on_borrow:
             return True
-        return self._factory.ping(c)
+        ok = self._factory.ping(c)
+        # 注意: ping_failures 由 ConnectionFactory 通过 stats_callback 报告
+        return ok
 
     # ------------------------------------------------------------------
     # Phase C 辅助: 最终登记 (锁内)
@@ -208,13 +232,20 @@ class BorrowReturn:
             if self._manager.is_shutdown:
                 return None
             c.mark_borrowed(capture_stack=self._capture_stack)
-            c._is_closed = False
             self._manager.register_borrowed(c)
             return c
 
-    # ---------------------------------------------------------- 归还
+    # ---------------------------------------------------------- 归还 (连接剥离流程)
 
     def release(self, conn: PooledConnection) -> None:
+        """
+        归还连接,采用"连接剥离"设计:
+        1) 锁内从 borrowed 注销
+        2) 锁外从旧 PooledConnection 剥离真实连接
+        3) 锁外 reset 真实连接
+        4) 锁外用真实连接创建新的 PooledConnection 包装
+        5) 锁内判断入池或销毁
+        """
         if conn is None:
             return
 
@@ -229,32 +260,51 @@ class BorrowReturn:
                 return
             conn.mark_returned()
 
-        # 2) 锁外 reset (可能包含 DB 回滚等 I/O)
-        reset_ok = self._factory.reset(conn)
+        # 2) 锁外剥离真实连接 (旧包装对象永久失效)
+        old_conn_id = conn.conn_id
+        real_conn = conn.strip_real_connection()
+        if real_conn is None:
+            logger.warning(
+                "Returned connection id=%s has no real connection, ignoring",
+                old_conn_id,
+            )
+            with self._cond:
+                self._wake_one_locked()
+            return
 
-        # 3) 锁内决定去向 + 唤醒
+        # 3) 锁外 reset 真实连接
+        reset_ok = self._factory.reset_real(real_conn, old_conn_id)
+        if not reset_ok:
+            # 注意: reset_failures 由 ConnectionFactory 通过 stats_callback 报告
+            self._factory.destroy_real(real_conn)
+            with self._cond:
+                self._wake_one_locked()
+            return
+
+        # 4) 锁外用真实连接创建新的 PooledConnection 包装
+        #    注意: 这里不持锁,但创建新 PooledConnection 只是内存操作很快
+        new_pooled = self._factory.wrap_real(real_conn, self._manager._pool_ref)
+
+        # 5) 锁内决定去向 + 唤醒
         with self._cond:
-            if not reset_ok:
-                self._factory.destroy(conn)
-                self._manager._stats.destroyed += 1
-                self._wake_one_locked()
-                return
-
             if self._manager.is_shutdown:
-                self._factory.destroy(conn)
-                self._manager._stats.destroyed += 1
+                self._factory.destroy_real(real_conn)
                 self._wake_one_locked()
                 return
 
-            if self._manager.total_count >= self._manager._max_size:
+            total = (
+                self._manager.idle_count
+                + self._manager.borrowed_count
+                + self._pending_creates
+                + self._manager.in_health_check_count
+            )
+            if total >= self._manager._max_size:
                 # 动态缩容后的超额连接
-                self._factory.destroy(conn)
-                self._manager._stats.destroyed += 1
+                self._factory.destroy_real(real_conn)
                 self._wake_one_locked()
                 return
 
-            conn._is_closed = False
-            self._manager.add_idle(conn)
+            self._manager.add_idle(new_pooled)
             self._wake_one_locked()
 
     # ---------------------------------------------------------- 唤醒
@@ -277,14 +327,21 @@ class BorrowReturn:
 
     # ---------------------------------------------------------- 优雅关闭
 
-    def wait_until_all_returned(self, timeout: float = 30.0) -> bool:
+    def wait_until_all_returned(self, timeout: float = 30.0) -> Tuple[bool, list[int]]:
+        """
+        在已经 begin_shutdown 之后调用:
+        - 新来的 borrow 直接抛 PoolClosedError;
+        - 归还流程正常走,每归还一个通知本线程,直到 borrowed==0 或超时。
+
+        返回: (是否全部归还, 超时时仍未归还的 conn_id 列表)
+        """
         deadline = time.monotonic() + timeout
         with self._cond:
             while self._manager.borrowed_count > 0:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    return False
+                    # 收集未归还的 conn_id 用于诊断
+                    outstanding = list(self._manager._borrowed.keys())
+                    return False, outstanding
                 self._cond.wait(timeout=remaining)
-        return True
-
-
+        return True, []
