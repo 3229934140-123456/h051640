@@ -61,6 +61,11 @@ def stats_to_dict(
             "p99_wait_seconds": round(getattr(stats, "p99_wait_seconds", 0.0), 6),
             "max_wait_seconds": round(getattr(stats, "max_wait_seconds", 0.0), 6),
         },
+        "last_events": {
+            "last_create_reason": getattr(stats, "last_create_reason", ""),
+            "last_destroy_reason": getattr(stats, "last_destroy_reason", ""),
+            "last_rotation_reason": getattr(stats, "last_rotation_reason", ""),
+        },
     }
     if extra:
         d.update(extra)

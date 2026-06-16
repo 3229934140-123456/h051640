@@ -24,6 +24,7 @@ from typing import Deque, Dict, Optional
 from .connection import PooledConnection
 from .connection_factory import ConnectionFactory
 from .time_window_stats import TimeWindowStats
+from .events import EventDispatcher, PoolEventType
 
 
 logger = logging.getLogger("db_pool.manager")
@@ -62,6 +63,11 @@ class PoolStats:
     # --- 轮换统计
     rotated_total: int = 0
 
+    # --- 最近事件追踪(用于审计/监控)
+    last_create_reason: str = ""
+    last_destroy_reason: str = ""
+    last_rotation_reason: str = ""
+
 
 class PoolManager:
     """
@@ -83,6 +89,7 @@ class PoolManager:
         min_size: int = 5,
         max_size: int = 30,
         pool_ref: Optional[object] = None,
+        event_dispatcher: Optional[EventDispatcher] = None,
     ) -> None:
         if not isinstance(factory, ConnectionFactory):
             raise TypeError("factory must be ConnectionFactory")
@@ -97,6 +104,7 @@ class PoolManager:
         self._min_size = min_size
         self._max_size = max_size
         self._pool_ref = pool_ref
+        self._events = event_dispatcher
 
         self._lock = threading.RLock()
         self._idle: Deque[PooledConnection] = deque()
@@ -165,15 +173,11 @@ class PoolManager:
             return
         created = 0
         for _ in range(self._min_size):
-            try:
-                conn = self._factory.create(self._pool_ref)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Pre-create connection failed: %s", exc)
-                # 注意: create_failures 由 ConnectionFactory 通过 stats_callback 报告
-                continue
+            conn = self.try_create_one(reason="warm_up")
+            if conn is None:
+                break
             with self._lock:
                 self._idle.append(conn)
-                self._stats.created += 1
             created += 1
         logger.info("Pool warm-up complete: %d/%d pre-created", created, self._min_size)
 
@@ -221,7 +225,7 @@ class PoolManager:
             except ValueError:
                 return False
 
-    def mark_health_check_return(self, conn: PooledConnection, still_alive: bool) -> None:
+    def mark_health_check_return(self, conn: PooledConnection, still_alive: bool, reason: str = "health_check") -> None:
         """
         健康检查完成,把连接要么放回 idle,要么销毁。无论哪种都要递减 in_health_check。
         """
@@ -231,28 +235,15 @@ class PoolManager:
             conn.touch_checked()
             self.add_idle(conn)
         else:
-            self.destroy_connection(conn)
+            self.destroy_connection(conn, reason=reason)
 
     def replace_idle(self, bad: PooledConnection) -> Optional[PooledConnection]:
         """
         用一个新建的好连接"顶替"掉空闲/刚取出但已坏的连接。
         返回新连接(如果还能创建),同时销毁坏连接。
         """
-        self._factory.destroy(bad)
-        with self._lock:
-            self._stats.destroyed += 1
-            total = len(self._idle) + len(self._borrowed) + self._in_health_check
-            if total >= self._max_size:
-                return None
-        try:
-            new_conn = self._factory.create(self._pool_ref)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Replace bad connection failed to create new one: %s", exc)
-            # 注意: create_failures 由 ConnectionFactory 通过 stats_callback 报告
-            return None
-        with self._lock:
-            self._stats.created += 1
-        return new_conn
+        self.destroy_connection(bad, reason="bad_connection_replace")
+        return self.try_create_one(reason="bad_connection_replace")
 
     # ---------------------------------------------------------- 借出集合操作
 
@@ -274,10 +265,11 @@ class PoolManager:
 
     # ---------------------------------------------------------- 创建 / 销毁
 
-    def try_create_one(self) -> Optional[PooledConnection]:
+    def try_create_one(self, reason: str = "manual") -> Optional[PooledConnection]:
         """
         若尚未达 max_size,创建一个新连接并计入统计。
         否则返回 None。
+        :param reason: 创建原因,用于事件和 last_create_reason 统计
         """
         with self._lock:
             total = len(self._idle) + len(self._borrowed) + self._in_health_check
@@ -291,9 +283,16 @@ class PoolManager:
             return None
         with self._lock:
             self._stats.created += 1
+            self._stats.last_create_reason = reason
+        if self._events is not None:
+            self._events.dispatch(
+                PoolEventType.CONNECTION_CREATED,
+                conn_id=conn.conn_id,
+                reason=reason,
+            )
         return conn
 
-    def destroy_connection(self, conn: PooledConnection) -> None:
+    def destroy_connection(self, conn: PooledConnection, reason: str = "manual") -> None:
         """销毁连接并从所有集合中移除。"""
         with self._lock:
             self._borrowed.pop(conn.conn_id, None)
@@ -301,9 +300,15 @@ class PoolManager:
                 self._idle.remove(conn)
             except ValueError:
                 pass
-        self._factory.destroy(conn)
-        with self._lock:
             self._stats.destroyed += 1
+            self._stats.last_destroy_reason = reason
+        if self._events is not None:
+            self._events.dispatch(
+                PoolEventType.CONNECTION_DESTROYED,
+                conn_id=conn.conn_id,
+                reason=reason,
+            )
+        self._factory.destroy(conn)
 
     # ---------------------------------------------------------- 动态伸缩
 
@@ -329,7 +334,7 @@ class PoolManager:
 
         need = self._min_size - self.total_count
         for _ in range(max(0, need)):
-            c = self.try_create_one()
+            c = self.try_create_one(reason="resize")
             if c is None:
                 break
             self.add_idle(c)
@@ -354,9 +359,17 @@ class PoolManager:
                     self._idle.remove(c)
                 except ValueError:
                     continue
-                self._factory.destroy(c)
                 self._stats.destroyed += 1
+                self._stats.last_destroy_reason = "shrink"
                 removed += 1
+                # 注意: 先从集合中移除,出锁再销毁(销毁可能有 I/O)
+                if self._events is not None:
+                    self._events.dispatch(
+                        PoolEventType.CONNECTION_DESTROYED,
+                        conn_id=c.conn_id,
+                        reason="shrink",
+                    )
+                self._factory.destroy(c)
         if removed:
             logger.info("Shrank pool: removed %d long-idle connections", removed)
         return removed
@@ -386,6 +399,9 @@ class PoolManager:
                 reset_failures=self._stats.reset_failures,
                 retried_operations=self._stats.retried_operations,
                 rotated_total=self._stats.rotated_total,
+                last_create_reason=self._stats.last_create_reason,
+                last_destroy_reason=self._stats.last_destroy_reason,
+                last_rotation_reason=self._stats.last_rotation_reason,
                 pending_creates=pending_creates,
                 in_health_check=self._in_health_check,
                 avg_wait_seconds=self._wait_stats.avg(),
@@ -418,10 +434,22 @@ class PoolManager:
         with self._lock:
             self._stats.retried_operations += n
 
-    def inc_rotated(self, n: int = 1) -> None:
+    def inc_rotated(self, n: int = 1, reason: str = "") -> None:
         """连接被轮换(因年龄或使用次数超限)时调用。"""
         with self._lock:
             self._stats.rotated_total += n
+            if reason:
+                self._stats.last_rotation_reason = reason
+
+    def set_last_create_reason(self, reason: str) -> None:
+        """记录最近一次创建连接的原因。"""
+        with self._lock:
+            self._stats.last_create_reason = reason
+
+    def set_last_destroy_reason(self, reason: str) -> None:
+        """记录最近一次销毁连接的原因。"""
+        with self._lock:
+            self._stats.last_destroy_reason = reason
 
     def acquire_lock(self) -> threading.RLock:
         """暴露锁,供借还模块做复合原子操作。"""
@@ -440,13 +468,27 @@ class PoolManager:
         with self._lock:
             while self._idle:
                 c = self._idle.pop()
-                self._factory.destroy(c)
                 self._stats.destroyed += 1
+                self._stats.last_destroy_reason = "force_shutdown"
                 n += 1
+                if self._events is not None:
+                    self._events.dispatch(
+                        PoolEventType.CONNECTION_DESTROYED,
+                        conn_id=c.conn_id,
+                        reason="force_shutdown",
+                    )
+                self._factory.destroy(c)
             for c in list(self._borrowed.values()):
-                self._factory.destroy(c)
                 self._stats.destroyed += 1
+                self._stats.last_destroy_reason = "force_shutdown"
                 n += 1
+                if self._events is not None:
+                    self._events.dispatch(
+                        PoolEventType.CONNECTION_DESTROYED,
+                        conn_id=c.conn_id,
+                        reason="force_shutdown",
+                    )
+                self._factory.destroy(c)
             self._borrowed.clear()
         return n
 

@@ -65,6 +65,7 @@ class HealthChecker:
         self._events = event_dispatcher
 
         self._stop_evt = threading.Event()
+        self._trigger_evt = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
     # ---------------------------------------------------------- 启停
@@ -97,7 +98,14 @@ class HealthChecker:
                 self._run_once()
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Health checker loop error: %s", exc)
-            self._stop_evt.wait(self._check_interval)
+            # 等待下一轮: 要么到 check_interval,要么被 trigger 立即唤醒
+            self._trigger_evt.wait(self._check_interval)
+            self._trigger_evt.clear()
+
+    def trigger_check(self) -> None:
+        """主动触发一次健康检查(异步,立即返回)。"""
+        if self._thread is not None and self._thread.is_alive():
+            self._trigger_evt.set()
 
     def _run_once(self) -> None:
         now = time.monotonic()
@@ -125,13 +133,7 @@ class HealthChecker:
         retired = 0
         for c in to_retire_age:
             if self._manager.remove_idle(c):
-                if self._events is not None:
-                    self._events.dispatch(
-                        PoolEventType.CONNECTION_DESTROYED,
-                        conn_id=c.conn_id,
-                        reason=f"max_lifetime_exceeded (age={c.age_seconds:.1f}s > max={self._max_lifetime}s)",
-                    )
-                self._manager.destroy_connection(c)
+                self._manager.destroy_connection(c, reason="max_lifetime")
                 retired += 1
         if retired:
             logger.info("Retired %d connections due to max_lifetime", retired)
@@ -162,12 +164,7 @@ class HealthChecker:
                             idle_seconds=c.idle_seconds,
                             age_seconds=c.age_seconds,
                         )
-                        self._events.dispatch(
-                            PoolEventType.CONNECTION_DESTROYED,
-                            conn_id=c.conn_id,
-                            reason="health_check_ping_failed",
-                        )
-                    self._manager.mark_health_check_return(c, still_alive=False)
+                    self._manager.mark_health_check_return(c, still_alive=False, reason="health_check_ping_failed")
                     dead += 1
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Health check ping failed for conn#%d: %s", c.conn_id, exc)
@@ -177,12 +174,7 @@ class HealthChecker:
                         conn_id=c.conn_id,
                         error=str(exc),
                     )
-                    self._events.dispatch(
-                        PoolEventType.CONNECTION_DESTROYED,
-                        conn_id=c.conn_id,
-                        reason=f"health_check_exception: {exc}",
-                    )
-                self._manager.mark_health_check_return(c, still_alive=False)
+                self._manager.mark_health_check_return(c, still_alive=False, reason="health_check_exception")
                 dead += 1
 
         # 4) 缩容
@@ -204,14 +196,7 @@ class HealthChecker:
         while not self._manager.is_shutdown and self._manager.can_create_more:
             if self._manager.total_count >= self._manager.min_size:
                 break
-            new_c = self._manager.try_create_one()
+            new_c = self._manager.try_create_one(reason="health_top_up")
             if new_c is None:
                 break
-            # 触发创建事件
-            if self._events is not None:
-                self._events.dispatch(
-                    PoolEventType.CONNECTION_CREATED,
-                    conn_id=new_c.conn_id,
-                    reason="top_up_min_size",
-                )
             self._manager.add_idle(new_c)

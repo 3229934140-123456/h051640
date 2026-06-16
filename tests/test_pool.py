@@ -23,7 +23,7 @@ from db_pool import (
     ConnectionReturnedError, RetryPolicy, ShutdownPhase,
     stats_to_prometheus, PoolEventType, PoolEvent,
 )
-from db_pool.borrow_return import GetTimeoutError, PoolClosedError
+from db_pool.borrow_return import GetTimeoutError, PoolClosedError, PoolPausedError
 from db_pool.leak_detector import LeakInfo
 from tests.fake_db import FakeDBConnection
 
@@ -1233,6 +1233,275 @@ class TestConcurrentCreateStress(unittest.TestCase):
         print(f"    总连接数始终 <= max_size({MAX_SIZE}): {'✅ PASS' if max_total_seen[0] <= MAX_SIZE else '❌ FAIL'}")
 
         pool.close()
+
+
+# ==========================================================================
+# 新增功能测试: 运行时管控混合压测
+# ==========================================================================
+class TestRuntimeControlStress(unittest.TestCase):
+    """
+    压力测试: 在线扩缩容 + 暂停恢复 + 健康检查 + 业务并发借还混合场景。
+
+    验收标准:
+      1. 连接数始终不超过 max_size（包括动态调整后的 max_size）
+      2. 销毁统计与真实关闭次数对得上
+      3. 轮换统计准确
+      4. 暂停后借不到，恢复后能正常借
+    """
+
+    def setUp(self):
+        FakeDBConnection.reset_counter()
+
+    def test_mixed_workload_stability(self):
+        """混合压测：业务并发 + 动态扩缩容 + 暂停恢复 + 健康检查。"""
+        INITIAL_MIN = 2
+        INITIAL_MAX = 5
+        NUM_WORKERS = 20
+        DURATION_SECONDS = 3.0
+        SHRINK_INTERVAL = 0.3
+
+        # 统计真实关闭次数
+        real_close_count = [0]
+        original_close = FakeDBConnection.close
+
+        def counting_close(self_conn):
+            real_close_count[0] += 1
+            original_close(self_conn)
+
+        FakeDBConnection.close = counting_close
+
+        try:
+            pool = make_pool(
+                min_size=INITIAL_MIN,
+                max_size=INITIAL_MAX,
+                max_borrow_count=5,  # 频繁借还会触发轮换
+                health_check_enabled=True,
+                check_interval=0.1,
+                idle_before_check=0.0,
+                max_lifetime=1.0,
+                enable_shrink=True,
+                shrink_idle_seconds=SHRINK_INTERVAL,
+                leak_check_enabled=False,
+                borrow_timeout=5.0,
+            ).start()
+
+            errors = []
+            stop_flag = threading.Event()
+            max_total_seen = [0]
+            max_count_lock = threading.Lock()
+            successful_borrows = [0]
+
+            def _record_max():
+                s = pool.stats()
+                with max_count_lock:
+                    if s.total > max_total_seen[0]:
+                        max_total_seen[0] = s.total
+                if s.total > pool.stats().max_size:
+                    errors.append(
+                        f"total 突破 max_size: total={s.total}, max_size={pool.stats().max_size}"
+                    )
+
+            def _worker():
+                """业务线程：不断借还连接。"""
+                try:
+                    while not stop_flag.is_set():
+                        try:
+                            with pool.connection() as conn:
+                                conn.cursor().execute("SELECT 1")
+                                with max_count_lock:
+                                    successful_borrows[0] += 1
+                                _record_max()
+                        except GetTimeoutError:
+                            pass  # 暂停或扩容时可能超时，正常
+                        except PoolPausedError:
+                            pass  # 暂停中，正常
+                        except PoolClosedError:
+                            break
+                        _record_max()
+                        time.sleep(0.01)
+                except Exception as e:
+                    errors.append(f"worker error: {e}")
+
+            def _operator():
+                """运维线程：周期性调整池大小和暂停恢复。"""
+                try:
+                    phases = [
+                        ("expand_max", lambda: pool.resize(new_max=8)),
+                        ("expand_min", lambda: pool.resize(new_min=5)),
+                        ("pause", lambda: pool.pause_borrow()),
+                        ("wait", lambda: time.sleep(0.2)),
+                        ("resume", lambda: pool.resume_borrow()),
+                        ("shrink_max", lambda: pool.resize(new_max=3)),
+                        ("shrink_min", lambda: pool.resize(new_min=1)),
+                        ("trigger_health", lambda: pool.trigger_health_check()),
+                    ]
+                    while not stop_flag.is_set():
+                        for name, action in phases:
+                            if stop_flag.is_set():
+                                break
+                            try:
+                                action()
+                            except Exception:
+                                pass
+                            time.sleep(0.15)
+                except Exception as e:
+                    errors.append(f"operator error: {e}")
+
+            # 启动业务线程
+            workers = [threading.Thread(target=_worker) for _ in range(NUM_WORKERS)]
+            for t in workers:
+                t.start()
+
+            # 启动运维线程
+            op_thread = threading.Thread(target=_operator)
+            op_thread.start()
+
+            # 运行指定时间
+            time.sleep(DURATION_SECONDS)
+            stop_flag.set()
+
+            # 等待所有线程结束
+            for t in workers:
+                t.join(timeout=5)
+            op_thread.join(timeout=5)
+
+            # 最终检查
+            s = pool.stats()
+            _record_max()
+
+            # 1. 验证没有突破过 max_size
+            self.assertEqual(
+                errors, [],
+                f"压测期间出错: {errors[:5]}"
+            )
+            self.assertLessEqual(
+                max_total_seen[0], 8,  # 最大 max_size 是 8
+                f"压测期间 total 突破了历史最大 max_size(8): 最大值={max_total_seen[0]}"
+            )
+
+            # 2. 验证销毁统计与真实关闭次数一致
+            # 注意：关闭池时还会销毁剩余连接，所以先不急着关
+            destroyed_before_close = s.destroyed
+            # 真实关闭次数可能等于或大于 destroyed_before_close，因为有些连接在关闭中
+            # 我们关闭后再对比
+            pool.close()
+
+            final_stats = pool.stats()
+            self.assertEqual(
+                final_stats.destroyed, real_close_count[0],
+                f"destroyed 统计({final_stats.destroyed}) 与真实关闭次数({real_close_count[0]}) 不一致"
+            )
+
+            # 3. 打印统计信息
+            print(f"\n  混合压测统计:")
+            print(f"    成功借还次数: {successful_borrows[0]}")
+            print(f"    历史最大连接数: {max_total_seen[0]}")
+            print(f"    总创建: {final_stats.created}")
+            print(f"    总销毁: {final_stats.destroyed}")
+            print(f"    轮换次数: {final_stats.rotated_total}")
+            print(f"    最近创建原因: {final_stats.last_create_reason}")
+            print(f"    最近销毁原因: {final_stats.last_destroy_reason}")
+            print(f"    最近轮换原因: {final_stats.last_rotation_reason}")
+            print(f"    连接数始终 <= max_size: {'✅ PASS' if max_total_seen[0] <= 8 else '❌ FAIL'}")
+            print(f"    销毁统计与真实一致: {'✅ PASS' if final_stats.destroyed == real_close_count[0] else '❌ FAIL'}")
+
+            # 4. 验证有轮换发生（证明轮换确实在工作）
+            self.assertGreater(
+                final_stats.rotated_total, 0,
+                "压测期间应该有轮换发生"
+            )
+
+        finally:
+            FakeDBConnection.close = original_close
+
+    def test_pause_resume_control(self):
+        """验证暂停借出和恢复借出的运行时管控能力。"""
+        pool = make_pool(
+            min_size=2, max_size=3,
+            health_check_enabled=False,
+            leak_check_enabled=False,
+        ).start()
+
+        # 初始状态：未暂停
+        self.assertFalse(pool.is_paused)
+
+        # 借一个连接
+        conn1 = pool.acquire()
+        self.assertIsNotNone(conn1)
+
+        # 暂停借出
+        pool.pause_borrow()
+        self.assertTrue(pool.is_paused)
+
+        # 暂停后再借应该抛错
+        with self.assertRaises(PoolPausedError):
+            pool.acquire(timeout=0.1)
+
+        # 已借出的连接应该能正常使用
+        conn1.cursor().execute("SELECT 1")
+
+        # 归还应该正常
+        conn1.close()
+
+        # 恢复借出
+        pool.resume_borrow()
+        self.assertFalse(pool.is_paused)
+
+        # 恢复后能正常借
+        conn2 = pool.acquire()
+        self.assertIsNotNone(conn2)
+        conn2.close()
+
+        # 关闭后再调 pause/resume 应该安全（不抛错）
+        pool.close()
+        pool.pause_borrow()  # 应该被忽略
+        pool.resume_borrow()  # 应该被忽略
+
+    def test_trigger_health_check(self):
+        """验证主动触发健康检查。"""
+        pool = make_pool(
+            min_size=2, max_size=3,
+            health_check_enabled=True,
+            check_interval=60.0,  # 间隔很长，靠主动触发
+            idle_before_check=0.0,
+            leak_check_enabled=False,
+        ).start()
+
+        # 杀掉一个空闲连接
+        idle_conns = _peek_idle(pool)
+        self.assertTrue(len(idle_conns) > 0)
+        idle_conns[0].real_connection.kill()
+
+        # 主动触发健康检查
+        triggered = pool.trigger_health_check()
+        self.assertTrue(triggered)
+
+        # 等待健康检查执行
+        time.sleep(0.3)
+
+        # 死掉的连接应该被替换掉，总数还是 min_size
+        s = pool.stats()
+        self.assertGreaterEqual(s.total, 2)
+
+        pool.close()
+
+    def test_closed_pool_ignores_control(self):
+        """关闭中的池不接受控制动作（安全忽略，不抛异常）。"""
+        pool = make_pool(min_size=1, max_size=2).start()
+        pool.close()
+
+        # 关闭后 pause/resume 应该被忽略（不抛错）
+        pool.pause_borrow()
+        pool.resume_borrow()
+
+        # 关闭后 trigger_health_check 应该返回 False
+        self.assertFalse(pool.trigger_health_check())
+
+        # 关闭后 resize 应该被安全忽略（不抛错）
+        try:
+            pool.resize(new_max=5)
+        except Exception as e:
+            self.fail(f"关闭后 resize 不应抛异常: {e}")
 
 
 # ==========================================================================

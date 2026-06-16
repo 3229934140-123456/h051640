@@ -182,10 +182,4 @@ class LeakDetector:
 
     def _reclaim(self, conn: PooledConnection) -> None:
         logger.error("Force-reclaiming leaked connection id=%s", conn.conn_id)
-        if self._events is not None:
-            self._events.dispatch(
-                PoolEventType.CONNECTION_DESTROYED,
-                conn_id=conn.conn_id,
-                reason="force_reclaim_leaked",
-            )
-        self._manager.destroy_connection(conn)
+        self._manager.destroy_connection(conn, reason="force_reclaim_leaked")

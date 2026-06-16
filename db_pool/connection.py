@@ -40,6 +40,7 @@ class PooledConnection:
         "_pool",
         "_id",
         "_created_at",
+        "_real_born_at",
         "_last_used_at",
         "_last_checked_at",
         "_borrowed_at",
@@ -64,6 +65,7 @@ class PooledConnection:
         self._pool = pool
         now = time.monotonic()
         self._created_at = now
+        self._real_born_at = now
         self._last_used_at = now
         self._last_checked_at = now
         self._borrowed_at = 0.0
@@ -112,6 +114,16 @@ class PooledConnection:
     @property
     def age_seconds(self) -> float:
         return time.monotonic() - self._created_at
+
+    @property
+    def real_born_at(self) -> float:
+        """底层真实连接的出生时间(首次被创建的时间,跨包装继承)。"""
+        return self._real_born_at
+
+    @property
+    def real_age_seconds(self) -> float:
+        """底层真实连接的总存活时间(跨包装继承,不会因归还重置)。"""
+        return time.monotonic() - self._real_born_at
 
     @property
     def idle_seconds(self) -> float:
@@ -185,6 +197,15 @@ class PooledConnection:
         """
         with self._lock:
             self._borrow_count = max(0, count)
+
+    def set_real_born_at(self, born_at: float) -> None:
+        """
+        内部使用: 从旧包装继承真实连接的出生时间(重新包装时调用)。
+        确保年龄轮换基于真实连接的总存活时间,不因重新包装而清零。
+        """
+        with self._lock:
+            if born_at > 0 and born_at <= time.monotonic():
+                self._real_born_at = born_at
 
     def mark_returned(self) -> None:
         """标记为已归还。"""

@@ -39,7 +39,7 @@ from typing import Any, Callable, Iterator, Optional, TYPE_CHECKING
 from .connection import ConnectionReturnedError, PooledConnection
 from .connection_factory import ConnectionFactory
 from .pool_manager import PoolManager, PoolStats
-from .borrow_return import BorrowReturn, GetTimeoutError, PoolClosedError
+from .borrow_return import BorrowReturn, GetTimeoutError, PoolClosedError, PoolPausedError
 from .health_check import HealthChecker
 from .leak_detector import LeakDetector, LeakInfo, LeakListener
 from .retry import RetryPolicy
@@ -194,6 +194,7 @@ class ConnectionPool:
             min_size=config.min_size,
             max_size=config.max_size,
             pool_ref=self,
+            event_dispatcher=self._event_dispatcher,
         )
 
         self._borrow = BorrowReturn(
@@ -316,13 +317,62 @@ class ConnectionPool:
 
     # ---------------------------------------------------------- 运行时控制
 
+    @property
+    def is_paused(self) -> bool:
+        """借出是否已被暂停。"""
+        return self._borrow.is_paused
+
+    def pause_borrow(self) -> None:
+        """
+        暂停借出。新的 borrow/acquire 请求会立即抛 PoolPausedError，
+        等待中的请求也会被唤醒并失败。已借出的连接不受影响。
+        池已关闭时调用无效。
+        """
+        if self.is_closed:
+            logger.warning("Pool is closed, ignore pause_borrow")
+            return
+        self._borrow.pause()
+        logger.info("Connection pool borrowing paused")
+
+    def resume_borrow(self) -> None:
+        """恢复借出。池已关闭时调用无效。"""
+        if self.is_closed:
+            logger.warning("Pool is closed, ignore resume_borrow")
+            return
+        self._borrow.resume()
+        logger.info("Connection pool borrowing resumed")
+
+    def trigger_health_check(self) -> bool:
+        """
+        主动触发一次健康检查(异步)。
+        返回 True 表示已触发，False 表示健康检查未启用或池已关闭。
+        """
+        if self.is_closed:
+            logger.warning("Pool is closed, ignore trigger_health_check")
+            return False
+        if self._health is None:
+            return False
+        self._health.trigger_check()
+        return True
+
     def resize(self, new_min: Optional[int] = None, new_max: Optional[int] = None) -> None:
-        """运行时调整池大小,立即生效。"""
+        """
+        运行时调整池大小,立即生效。
+        池已关闭时调用无效。
+        """
+        if self.is_closed:
+            logger.warning("Pool is closed, ignore resize")
+            return
         self._manager.resize(new_min=new_min, new_max=new_max)
+        if self._health is not None:
+            self._health.trigger_check()
 
     def stats(self) -> PoolStats:
         """获取当前运行统计快照。"""
-        return self._manager.snapshot_stats(waiting=self._borrow.waiting_count)
+        return self._manager.snapshot_stats(
+            waiting=self._borrow.waiting_count,
+            pending_creates=self._borrow.pending_creates,
+        )
 
     # ---------------------------------------------------------- 事件订阅
 
