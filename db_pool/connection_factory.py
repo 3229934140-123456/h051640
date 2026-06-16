@@ -261,6 +261,12 @@ class ConnectionFactory:
 
     # ------------------------------------------------------------------ 包装新连接
 
-    def wrap_real(self, real_conn: Any, pool_ref: Any) -> PooledConnection:
-        """把一个剥离出来的真实连接重新包装为新的 PooledConnection。"""
-        return PooledConnection(real_conn, pool_ref)
+    def wrap_real(self, real_conn: Any, pool_ref: Any, borrow_count: int = 0) -> PooledConnection:
+        """
+        把一个剥离出来的真实连接重新包装为新的 PooledConnection。
+        :param borrow_count: 从旧包装继承的借还次数,用于轮换判断
+        """
+        conn = PooledConnection(real_conn, pool_ref)
+        if borrow_count > 0:
+            conn.set_borrow_count(borrow_count)
+        return conn

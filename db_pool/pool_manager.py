@@ -44,20 +44,23 @@ class PoolStats:
     timeouts: int = 0
     leaked: int = 0
 
-    # --- 新增: 失败计数
+    # --- 失败计数
     create_failures: int = 0
     ping_failures: int = 0
     reset_failures: int = 0
     retried_operations: int = 0
 
-    # --- 新增: 并发状态量
+    # --- 并发状态量
     pending_creates: int = 0
     in_health_check: int = 0
 
-    # --- 新增: 等待耗时 (滑动窗口)
+    # --- 等待耗时 (滑动窗口)
     avg_wait_seconds: float = 0.0
     p99_wait_seconds: float = 0.0
     max_wait_seconds: float = 0.0
+
+    # --- 轮换统计
+    rotated_total: int = 0
 
 
 class PoolManager:
@@ -382,6 +385,7 @@ class PoolManager:
                 ping_failures=self._stats.ping_failures,
                 reset_failures=self._stats.reset_failures,
                 retried_operations=self._stats.retried_operations,
+                rotated_total=self._stats.rotated_total,
                 pending_creates=pending_creates,
                 in_health_check=self._in_health_check,
                 avg_wait_seconds=self._wait_stats.avg(),
@@ -413,6 +417,11 @@ class PoolManager:
     def inc_retried(self, n: int = 1) -> None:
         with self._lock:
             self._stats.retried_operations += n
+
+    def inc_rotated(self, n: int = 1) -> None:
+        """连接被轮换(因年龄或使用次数超限)时调用。"""
+        with self._lock:
+            self._stats.rotated_total += n
 
     def acquire_lock(self) -> threading.RLock:
         """暴露锁,供借还模块做复合原子操作。"""

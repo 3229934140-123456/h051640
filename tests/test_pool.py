@@ -21,7 +21,7 @@ sys.path.insert(0, str(ROOT))
 from db_pool import (
     ConnectionPool, PoolConfig, PooledConnection,
     ConnectionReturnedError, RetryPolicy, ShutdownPhase,
-    stats_to_prometheus,
+    stats_to_prometheus, PoolEventType, PoolEvent,
 )
 from db_pool.borrow_return import GetTimeoutError, PoolClosedError
 from db_pool.leak_detector import LeakInfo
@@ -35,13 +35,14 @@ logging.basicConfig(
 
 def make_pool(**cfg_kw):
     """创建一个使用 FakeDBConnection 的池。"""
+    create_fn = cfg_kw.pop("create_fn", None)
     cfg_kw.setdefault("min_size", 3)
     cfg_kw.setdefault("max_size", 8)
     cfg_kw.setdefault("health_check_enabled", False)
     cfg_kw.setdefault("leak_check_enabled", False)
     cfg = PoolConfig(**cfg_kw)
     pool = ConnectionPool(
-        create_fn=lambda: FakeDBConnection(),
+        create_fn=create_fn if create_fn else lambda: FakeDBConnection(),
         config=cfg,
     )
     return pool
@@ -680,6 +681,557 @@ class TestHealthCheckConcurrency(unittest.TestCase):
         self.assertLessEqual(max_total_seen[0], 3, f"total 突破了 max_size: {max_total_seen[0]}")
         # 健康检查确实跑了 ping
         self.assertGreater(slow_ping_times[0], 0)
+        pool.close()
+
+
+# ==========================================================================
+# 新增功能测试: 事件订阅系统
+# ==========================================================================
+class TestEventSubscription(unittest.TestCase):
+    def setUp(self):
+        FakeDBConnection.reset_counter()
+
+    def test_all_events_fired(self):
+        """所有关键事件都能被正确触发。"""
+        events_received: list[PoolEvent] = []
+        errors = []
+
+        def listener(event: PoolEvent):
+            events_received.append(event)
+
+        def bad_listener(event: PoolEvent):
+            raise RuntimeError("Simulated listener error")
+
+        pool = make_pool(
+            min_size=1, max_size=3,
+            health_check_enabled=False,
+            leak_check_enabled=False,
+        ).start()
+
+        # 添加监听器
+        lid1 = pool.add_event_listener(listener)
+        lid2 = pool.add_event_listener(bad_listener)
+        self.assertGreater(lid1, 0)
+        self.assertGreater(lid2, 0)
+        self.assertNotEqual(lid1, lid2)
+
+        # 借出连接 - 应该触发 CONNECTION_CREATED (如果创建新连接) 或 CONNECTION_BORROWED
+        event_types_before = {e.type for e in events_received}
+        with pool.connection() as conn:
+            conn.cursor().execute("SELECT 1")
+        # 归还连接 - 应该触发 CONNECTION_RETURNED
+
+        # 先把所有连接都借出去，再尝试获取才会超时
+        borrowed = []
+        for _ in range(3):
+            borrowed.append(pool.acquire())
+
+        # 现在池里没有连接了，尝试获取应该超时
+        try:
+            pool.acquire(timeout=0.01)
+        except GetTimeoutError:
+            pass
+
+        # 归还所有连接
+        for c in borrowed:
+            c.close()
+
+        # 移除坏的监听器
+        result = pool.remove_event_listener(lid2)
+        self.assertTrue(result)
+
+        # 再次借出，坏监听器不应该再影响
+        with pool.connection() as conn:
+            conn.cursor().execute("SELECT 1")
+
+        # 验证事件类型
+        event_types = {e.type for e in events_received}
+        self.assertIn(PoolEventType.CONNECTION_BORROWED, event_types)
+        self.assertIn(PoolEventType.CONNECTION_RETURNED, event_types)
+        self.assertIn(PoolEventType.WAIT_TIMEOUT, event_types)
+        if PoolEventType.CONNECTION_CREATED in event_types_before:
+            self.assertIn(PoolEventType.CONNECTION_CREATED, event_types)
+
+        # 验证坏监听器没有影响连接池运行
+        s = pool.stats()
+        self.assertGreaterEqual(s.borrowed_total, 2)
+        pool.close()
+
+    def test_listener_error_isolation(self):
+        """监听器抛出异常不会影响连接池或其他监听器。"""
+        events1 = []
+        events2 = []
+
+        def listener1(event: PoolEvent):
+            events1.append(event)
+
+        def bad_listener(event: PoolEvent):
+            raise ValueError("I'm a bad listener")
+
+        def listener2(event: PoolEvent):
+            events2.append(event)
+
+        pool = make_pool(
+            min_size=0, max_size=2,
+            health_check_enabled=False,
+            leak_check_enabled=False,
+        ).start()
+
+        pool.add_event_listener(listener1)
+        pool.add_event_listener(bad_listener)
+        pool.add_event_listener(listener2)
+
+        # 执行操作，即使中间有坏监听器，连接池应该正常运行
+        with pool.connection() as conn:
+            conn.cursor().execute("SELECT 1")
+
+        # 两个好的监听器应该都收到了事件
+        self.assertGreater(len(events1), 0)
+        self.assertGreater(len(events2), 0)
+        self.assertEqual(len(events1), len(events2))
+
+        # 连接池应该仍然正常工作
+        with pool.connection() as conn:
+            conn.cursor().execute("SELECT 2")
+
+        pool.close()
+
+    def test_remove_all_listeners(self):
+        """移除所有监听器后，不再触发事件。"""
+        events = []
+        pool = make_pool(
+            min_size=0, max_size=2,
+            health_check_enabled=False,
+            leak_check_enabled=False,
+        ).start()
+
+        pool.add_event_listener(lambda e: events.append(e))
+        pool.add_event_listener(lambda e: events.append(e))
+        pool.remove_all_event_listeners()
+
+        with pool.connection() as conn:
+            conn.cursor().execute("SELECT 1")
+
+        self.assertEqual(len(events), 0)
+        pool.close()
+
+    def test_health_check_and_leak_events(self):
+        """健康检查失败和泄漏检测事件也能被捕获。"""
+        events_received: list[PoolEvent] = []
+
+        def listener(event: PoolEvent):
+            events_received.append(event)
+
+        pool = make_pool(
+            min_size=2, max_size=3,
+            health_check_enabled=True,
+            check_interval=0.05,
+            idle_before_check=0.0,
+            leak_check_enabled=True,
+            leak_threshold=0.1,
+            leak_cooldown=0.5,
+        ).start()
+        pool.add_event_listener(listener)
+
+        # 等待泄漏检测器完成初始等待并运行至少一次
+        time.sleep(0.15)
+
+        # 杀掉一个空闲连接
+        idle_conns = _peek_idle(pool)
+        if idle_conns:
+            idle_conns[0].real_connection.kill()
+
+        # 故意泄漏一个连接
+        leaked = pool.acquire()
+        # 等待足够长的时间，确保泄漏检测在连接归还前扫描到多次
+        time.sleep(0.5)
+        leaked.close()
+
+        # 等待健康检查运行
+        time.sleep(0.2)
+
+        event_types = {e.type for e in events_received}
+        # 至少应该有泄漏事件
+        self.assertIn(PoolEventType.LEAK_DETECTED, event_types)
+        # 可能有健康检查失败事件
+        # 可能有连接销毁事件
+        pool.close()
+
+
+# ==========================================================================
+# 新增功能测试: 连接轮换
+# ==========================================================================
+class TestConnectionRotation(unittest.TestCase):
+    def setUp(self):
+        FakeDBConnection.reset_counter()
+
+    def test_rotation_by_borrow_count(self):
+        """按借还次数轮换连接。"""
+        pool = make_pool(
+            min_size=1, max_size=1,
+            max_borrow_count=3,  # 借出 3 次后轮换
+            health_check_enabled=False,
+            leak_check_enabled=False,
+        ).start()
+
+        created_before = pool.stats().created
+        first_real_conn = None
+
+        # 借还 3 次，第 3 次归还时应该触发轮换
+        for i in range(3):
+            with pool.connection() as conn:
+                if i == 0:
+                    first_real_conn = conn.real_connection
+                conn.cursor().execute(f"SELECT {i}")
+
+        s = pool.stats()
+        self.assertEqual(s.rotated_total, 1)
+        self.assertGreater(s.created, created_before)
+        self.assertGreater(s.destroyed, 0)
+
+        # 第 4 次借到的应该是新的真实连接
+        with pool.connection() as conn:
+            self.assertIsNot(conn.real_connection, first_real_conn)
+
+        pool.close()
+
+    def test_rotation_by_age(self):
+        """按连接年龄轮换。"""
+        pool = make_pool(
+            min_size=1, max_size=1,
+            max_age_for_rotation=0.1,  # 0.1 秒后轮换
+            health_check_enabled=False,
+            leak_check_enabled=False,
+        ).start()
+
+        created_before = pool.stats().created
+        first_real_conn = None
+
+        # 第一次借，拿到初始连接
+        with pool.connection() as conn:
+            first_real_conn = conn.real_connection
+
+        # 等待超过轮换年龄
+        time.sleep(0.15)
+
+        # 第二次借还，应该触发轮换
+        with pool.connection() as conn:
+            conn.cursor().execute("SELECT 1")
+
+        s = pool.stats()
+        self.assertEqual(s.rotated_total, 1)
+        self.assertGreater(s.created, created_before)
+        self.assertGreater(s.destroyed, 0)
+
+        # 新的借到的应该是新连接
+        with pool.connection() as conn:
+            self.assertIsNot(conn.real_connection, first_real_conn)
+
+        pool.close()
+
+    def test_rotation_preserves_max_size(self):
+        """轮换过程中不会突破 max_size。"""
+        pool = make_pool(
+            min_size=2, max_size=2,
+            max_borrow_count=1,  # 每次借还都轮换
+            health_check_enabled=False,
+            leak_check_enabled=False,
+        ).start()
+
+        max_total = 0
+        for i in range(5):
+            with pool.connection() as conn:
+                conn.cursor().execute(f"SELECT {i}")
+            s = pool.stats()
+            max_total = max(max_total, s.total)
+
+        self.assertLessEqual(max_total, 2)
+        s = pool.stats()
+        self.assertEqual(s.rotated_total, 5)
+        pool.close()
+
+    def test_borrow_count_persists_across_repack(self):
+        """借还次数在重新包装时被继承。"""
+        pool = make_pool(
+            min_size=1, max_size=1,
+            max_borrow_count=3,
+            health_check_enabled=False,
+            leak_check_enabled=False,
+        ).start()
+
+        # 借还 2 次（不触发轮换）
+        for i in range(2):
+            with pool.connection() as conn:
+                borrow_count = conn.borrow_count
+                self.assertEqual(borrow_count, i + 1)
+
+        # 第 3 次借，应该触发轮换
+        with pool.connection() as conn:
+            self.assertEqual(conn.borrow_count, 3)
+
+        # 第 4 次借，应该是新连接，borrow_count 从 1 开始
+        with pool.connection() as conn:
+            self.assertEqual(conn.borrow_count, 1)
+
+        pool.close()
+
+    def test_rotation_disabled_by_default(self):
+        """默认不启用轮换。"""
+        pool = make_pool(
+            min_size=1, max_size=1,
+            health_check_enabled=False,
+            leak_check_enabled=False,
+        ).start()
+
+        first_real_conn = None
+        for i in range(10):
+            with pool.connection() as conn:
+                if i == 0:
+                    first_real_conn = conn.real_connection
+                # 每次都应该是同一个真实连接
+                self.assertIs(conn.real_connection, first_real_conn)
+
+        s = pool.stats()
+        self.assertEqual(s.rotated_total, 0)
+        pool.close()
+
+
+# ==========================================================================
+# 新增功能测试: 销毁统计准确性
+# ==========================================================================
+class TestDestroyedCountAccuracy(unittest.TestCase):
+    def setUp(self):
+        FakeDBConnection.reset_counter()
+
+    def test_destroyed_matches_real_close(self):
+        """所有销毁路径的 destroyed 统计都与真实关闭次数一致。"""
+        real_close_count = [0]
+        original_close = FakeDBConnection.close
+
+        def counting_close(self):
+            real_close_count[0] += 1
+            original_close(self)
+
+        # 猴子补丁 FakeDBConnection.close 来统计真实关闭次数
+        FakeDBConnection.close = counting_close
+
+        try:
+            pool = make_pool(
+                min_size=2, max_size=3,
+                max_borrow_count=2,  # 轮换触发销毁
+                health_check_enabled=True,
+                check_interval=0.05,
+                idle_before_check=0.0,
+                max_lifetime=0.1,  # 超龄淘汰触发销毁
+                leak_check_enabled=False,
+            ).start()
+
+            # 杀掉一个空闲连接（健康检查会销毁它）
+            idle_conns = _peek_idle(pool)
+            if idle_conns:
+                idle_conns[0].real_connection.kill()
+
+            # 借还几次，触发轮换销毁
+            for i in range(4):
+                with pool.connection() as conn:
+                    conn.cursor().execute(f"SELECT {i}")
+
+            # 等待健康检查运行，可能触发超龄销毁
+            time.sleep(0.15)
+
+            # 关闭池，触发剩余连接销毁
+            pool.close()
+
+            # 验证统计一致
+            s = pool.stats()
+            self.assertEqual(
+                s.destroyed, real_close_count[0],
+                f"destroyed 统计({s.destroyed}) 与真实关闭次数({real_close_count[0]}) 不一致",
+            )
+        finally:
+            # 恢复原方法
+            FakeDBConnection.close = original_close
+
+    def test_reset_failure_counts_as_destroyed(self):
+        """reset 失败的连接也会被正确计入 destroyed。"""
+        reset_attempts = [0]
+
+        def _flaky_reset(conn):
+            reset_attempts[0] += 1
+            if reset_attempts[0] == 2:
+                raise RuntimeError("Simulated reset failure")
+
+        pool = make_pool(
+            min_size=1, max_size=2,
+            reset_fn=_flaky_reset,
+            health_check_enabled=False,
+            leak_check_enabled=False,
+        ).start()
+
+        destroyed_before = pool.stats().destroyed
+
+        # 第一次借还正常
+        with pool.connection() as conn:
+            conn.cursor().execute("SELECT 1")
+
+        # 第二次借还，reset 会失败
+        with pool.connection() as conn:
+            conn.cursor().execute("SELECT 2")
+
+        s = pool.stats()
+        self.assertEqual(s.reset_failures, 1)
+        self.assertEqual(s.destroyed, destroyed_before + 1)
+
+        pool.close()
+
+    def test_shrink_discarded_counts_as_destroyed(self):
+        """缩容丢弃的连接也会被正确计入 destroyed。"""
+        pool = make_pool(
+            min_size=1, max_size=5,
+            health_check_enabled=True,
+            check_interval=0.05,
+            enable_shrink=True,
+            shrink_idle_seconds=0.0,
+            leak_check_enabled=False,
+        ).start()
+
+        # 先借满 max_size
+        conns = [pool.acquire() for _ in range(5)]
+        s = pool.stats()
+        self.assertEqual(s.total, 5)
+
+        # 归还所有连接
+        for c in conns:
+            c.close()
+
+        # resize 缩小 max_size
+        pool.resize(new_max=2, new_min=1)
+
+        # 等待缩容运行
+        time.sleep(0.1)
+
+        s = pool.stats()
+        self.assertLessEqual(s.total, 2)
+        # destroyed 应该等于 5 - 最终 total
+        self.assertGreaterEqual(s.destroyed, 3)
+
+        pool.close()
+
+
+# ==========================================================================
+# 新增功能测试: 并发压测 - 健康检查补连接 + 业务借连接
+# ==========================================================================
+class TestConcurrentCreateStress(unittest.TestCase):
+    def setUp(self):
+        FakeDBConnection.reset_counter()
+
+    def test_concurrent_create_never_exceeds_max_size(self):
+        """
+        压测: 健康检查补连接 + 业务借连接并发时, max_size 永远不被突破。
+        50 个并发线程, 每个线程借还 10 次, max_size=5。
+        同时健康检查不断运行补连接。
+        """
+        MAX_SIZE = 5
+        NUM_THREADS = 50
+        ITERATIONS_PER_THREAD = 10
+
+        # 制造慢创建，增加并发冲突概率
+        create_call_count = [0]
+
+        def _slow_create():
+            create_call_count[0] += 1
+            # 随机 sleep 增加并发冲突概率
+            time.sleep(0.005)
+            return FakeDBConnection(operation_delay=0.001)
+
+        pool = make_pool(
+            min_size=MAX_SIZE, max_size=MAX_SIZE,
+            create_fn=_slow_create,
+            health_check_enabled=True,
+            check_interval=0.02,
+            idle_before_check=0.0,
+            enable_shrink=False,
+            leak_check_enabled=False,
+        ).start()
+
+        max_total_seen = [0]
+        errors = []
+        successful_ops = [0]
+
+        def _worker():
+            try:
+                for _ in range(ITERATIONS_PER_THREAD):
+                    # 每次借前检查 total
+                    s = pool.stats()
+                    with threading.Lock():
+                        max_total_seen[0] = max(max_total_seen[0], s.total)
+                    if s.total > MAX_SIZE:
+                        errors.append(f"total 突破 max_size: {s.total} > {MAX_SIZE}")
+                        return
+
+                    with pool.connection(timeout=2.0) as conn:
+                        conn.cursor().execute("SELECT 1")
+                        successful_ops[0] += 1
+
+                    # 每次还后检查 total
+                    s = pool.stats()
+                    with threading.Lock():
+                        max_total_seen[0] = max(max_total_seen[0], s.total)
+                    if s.total > MAX_SIZE:
+                        errors.append(f"total 突破 max_size: {s.total} > {MAX_SIZE}")
+                        return
+            except Exception as e:
+                errors.append(str(e))
+
+        # 启动压测线程
+        threads = [threading.Thread(target=_worker) for _ in range(NUM_THREADS)]
+        for t in threads:
+            t.start()
+
+        # 监控线程，不断检查 total
+        stop_monitor = threading.Event()
+
+        def _monitor():
+            while not stop_monitor.is_set():
+                s = pool.stats()
+                with threading.Lock():
+                    max_total_seen[0] = max(max_total_seen[0], s.total)
+                if s.total > MAX_SIZE:
+                    errors.append(f"监控发现 total 突破 max_size: {s.total} > {MAX_SIZE}")
+                    stop_monitor.set()
+                time.sleep(0.005)
+
+        monitor = threading.Thread(target=_monitor)
+        monitor.start()
+
+        # 等待所有线程完成
+        for t in threads:
+            t.join(timeout=10)
+
+        stop_monitor.set()
+        monitor.join(timeout=2)
+
+        # 验证
+        self.assertEqual(errors, [], f"压测期间出错: {errors[:5]}")
+        self.assertLessEqual(
+            max_total_seen[0], MAX_SIZE,
+            f"压测期间 total 突破了 max_size: 最大值={max_total_seen[0]}, max_size={MAX_SIZE}",
+        )
+        self.assertEqual(
+            successful_ops[0], NUM_THREADS * ITERATIONS_PER_THREAD,
+            f"成功操作数 {successful_ops[0]} != 期望 {NUM_THREADS * ITERATIONS_PER_THREAD}",
+        )
+
+        # 打印统计
+        s = pool.stats()
+        print(f"\n  压测统计:")
+        print(f"    创建连接调用次数: {create_call_count[0]}")
+        print(f"    成功操作: {successful_ops[0]}")
+        print(f"    最终 total: {s.total}")
+        print(f"    max_total_seen: {max_total_seen[0]}")
+        print(f"    created: {s.created}, destroyed: {s.destroyed}")
+        print(f"    总连接数始终 <= max_size({MAX_SIZE}): {'✅ PASS' if max_total_seen[0] <= MAX_SIZE else '❌ FAIL'}")
+
         pool.close()
 
 

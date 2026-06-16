@@ -48,6 +48,7 @@ class PooledConnection:
         "_borrow_stack",
         "_is_closed",
         "_returned",
+        "_borrow_count",
         "_lock",
     )
 
@@ -71,6 +72,7 @@ class PooledConnection:
         self._borrow_stack: str = ""
         self._is_closed = False
         self._returned = False
+        self._borrow_count = 0
         self._lock = threading.RLock()
 
     # ------------------------------------------------------------------ 元数据
@@ -141,6 +143,11 @@ class PooledConnection:
     def is_returned(self) -> bool:
         return self._returned
 
+    @property
+    def borrow_count(self) -> int:
+        """该真实连接被借出的总次数(跨包装复用)。"""
+        return self._borrow_count
+
     def touch_used(self) -> None:
         self._check_usable()
         self._last_used_at = time.monotonic()
@@ -165,10 +172,19 @@ class PooledConnection:
             self._borrower_thread = threading.get_ident()
             self._last_used_at = self._borrowed_at
             self._is_closed = False
+            self._borrow_count += 1
             if capture_stack:
                 self._borrow_stack = "".join(traceback.format_stack()[:-2])
             else:
                 self._borrow_stack = ""
+
+    def set_borrow_count(self, count: int) -> None:
+        """
+        内部使用: 从旧包装继承借还次数(重新包装时调用)。
+        因为真实连接被复用,所以借还次数需要跨包装继承。
+        """
+        with self._lock:
+            self._borrow_count = max(0, count)
 
     def mark_returned(self) -> None:
         """标记为已归还。"""

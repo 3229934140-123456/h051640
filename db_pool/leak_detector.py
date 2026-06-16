@@ -23,6 +23,7 @@ from typing import Callable, Optional, Set
 
 from .connection import PooledConnection
 from .pool_manager import PoolManager
+from .events import EventDispatcher, PoolEventType
 
 
 logger = logging.getLogger("db_pool.leak")
@@ -59,6 +60,7 @@ class LeakDetector:
         leak_cooldown: float = 600.0,
         force_reclaim_leaked: bool = False,
         leak_listener: Optional[LeakListener] = None,
+        event_dispatcher: Optional[EventDispatcher] = None,
     ) -> None:
         if check_interval <= 0:
             raise ValueError("check_interval must be > 0")
@@ -71,6 +73,7 @@ class LeakDetector:
         self._leak_cooldown = leak_cooldown
         self._force_reclaim = force_reclaim_leaked
         self._listener = leak_listener
+        self._events = event_dispatcher
 
         # conn_id -> 上次告警时间(monotonic)
         self._last_alert: dict[int, float] = {}
@@ -162,6 +165,15 @@ class LeakDetector:
             info.conn_id, info.borrowed_seconds, info.borrower_thread,
             info.stack, conn,
         )
+        # 触发泄漏事件
+        if self._events is not None:
+            self._events.dispatch(
+                PoolEventType.LEAK_DETECTED,
+                conn_id=info.conn_id,
+                borrowed_seconds=info.borrowed_seconds,
+                borrower_thread=info.borrower_thread,
+                stack=info.stack,
+            )
         if self._listener is not None:
             try:
                 self._listener(info)
@@ -170,4 +182,10 @@ class LeakDetector:
 
     def _reclaim(self, conn: PooledConnection) -> None:
         logger.error("Force-reclaiming leaked connection id=%s", conn.conn_id)
+        if self._events is not None:
+            self._events.dispatch(
+                PoolEventType.CONNECTION_DESTROYED,
+                conn_id=conn.conn_id,
+                reason="force_reclaim_leaked",
+            )
         self._manager.destroy_connection(conn)

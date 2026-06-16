@@ -23,6 +23,7 @@ from typing import Optional
 from .connection import PooledConnection
 from .connection_factory import ConnectionFactory
 from .pool_manager import PoolManager
+from .events import EventDispatcher, PoolEventType
 
 
 logger = logging.getLogger("db_pool.health")
@@ -49,6 +50,7 @@ class HealthChecker:
         max_lifetime: float = 1800.0,
         enable_shrink: bool = True,
         shrink_idle_seconds: float = 300.0,
+        event_dispatcher: Optional[EventDispatcher] = None,
     ) -> None:
         if check_interval <= 0:
             raise ValueError("check_interval must be > 0")
@@ -60,6 +62,7 @@ class HealthChecker:
         self._max_lifetime = max_lifetime
         self._enable_shrink = enable_shrink
         self._shrink_idle_seconds = shrink_idle_seconds
+        self._events = event_dispatcher
 
         self._stop_evt = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -122,6 +125,12 @@ class HealthChecker:
         retired = 0
         for c in to_retire_age:
             if self._manager.remove_idle(c):
+                if self._events is not None:
+                    self._events.dispatch(
+                        PoolEventType.CONNECTION_DESTROYED,
+                        conn_id=c.conn_id,
+                        reason=f"max_lifetime_exceeded (age={c.age_seconds:.1f}s > max={self._max_lifetime}s)",
+                    )
                 self._manager.destroy_connection(c)
                 retired += 1
         if retired:
@@ -146,10 +155,33 @@ class HealthChecker:
                         "Connection id=%s is dead (idle for %.0fs, age %.0fs), removing",
                         c.conn_id, c.idle_seconds, c.age_seconds,
                     )
+                    if self._events is not None:
+                        self._events.dispatch(
+                            PoolEventType.HEALTH_CHECK_FAILED,
+                            conn_id=c.conn_id,
+                            idle_seconds=c.idle_seconds,
+                            age_seconds=c.age_seconds,
+                        )
+                        self._events.dispatch(
+                            PoolEventType.CONNECTION_DESTROYED,
+                            conn_id=c.conn_id,
+                            reason="health_check_ping_failed",
+                        )
                     self._manager.mark_health_check_return(c, still_alive=False)
                     dead += 1
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Health check ping failed for conn#%d: %s", c.conn_id, exc)
+                if self._events is not None:
+                    self._events.dispatch(
+                        PoolEventType.HEALTH_CHECK_FAILED,
+                        conn_id=c.conn_id,
+                        error=str(exc),
+                    )
+                    self._events.dispatch(
+                        PoolEventType.CONNECTION_DESTROYED,
+                        conn_id=c.conn_id,
+                        reason=f"health_check_exception: {exc}",
+                    )
                 self._manager.mark_health_check_return(c, still_alive=False)
                 dead += 1
 
@@ -175,4 +207,11 @@ class HealthChecker:
             new_c = self._manager.try_create_one()
             if new_c is None:
                 break
+            # 触发创建事件
+            if self._events is not None:
+                self._events.dispatch(
+                    PoolEventType.CONNECTION_CREATED,
+                    conn_id=new_c.conn_id,
+                    reason="top_up_min_size",
+                )
             self._manager.add_idle(new_c)

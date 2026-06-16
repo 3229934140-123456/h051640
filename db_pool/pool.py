@@ -45,6 +45,7 @@ from .leak_detector import LeakDetector, LeakInfo, LeakListener
 from .retry import RetryPolicy
 from .shutdown_state import ShutdownInfo, ShutdownPhase, ShutdownState
 from .metrics import stats_to_dict, stats_to_json, stats_to_prometheus
+from .events import EventDispatcher, PoolEvent, PoolEventType, EventListener
 
 
 if TYPE_CHECKING:
@@ -95,6 +96,10 @@ class PoolConfig:
 
     可观测性:
         pool_name:            池名称,用于 Prometheus 标签区分多个池
+
+    连接轮换 (平滑替换老连接,避免被服务端踢掉):
+        max_borrow_count:     单个连接最多被借还多少次后轮换 (0=不限)
+        max_age_for_rotation: 单个连接最多存活多少秒后轮换 (0=不限)
     """
     min_size: int = 5
     max_size: int = 30
@@ -122,6 +127,9 @@ class PoolConfig:
 
     retry_policy: Optional[RetryPolicy] = None
     pool_name: str = "default"
+
+    max_borrow_count: int = 0
+    max_age_for_rotation: float = 0.0
 
 
 # --------------------------------------------------------------------------- 主类
@@ -178,6 +186,9 @@ class ConnectionPool:
         # 关闭状态机
         self._shutdown_state = ShutdownState()
 
+        # 事件分发器
+        self._event_dispatcher = EventDispatcher(pool_name=config.pool_name)
+
         self._manager = PoolManager(
             self._factory,
             min_size=config.min_size,
@@ -191,6 +202,9 @@ class ConnectionPool:
             borrow_timeout=config.borrow_timeout,
             test_on_borrow=config.test_on_borrow,
             capture_stack_on_borrow=config.capture_stack,
+            max_borrow_count=config.max_borrow_count,
+            max_age_for_rotation=config.max_age_for_rotation,
+            event_dispatcher=self._event_dispatcher,
         )
 
         self._health: Optional[HealthChecker] = None
@@ -203,6 +217,7 @@ class ConnectionPool:
                 max_lifetime=config.max_lifetime,
                 enable_shrink=config.enable_shrink,
                 shrink_idle_seconds=config.shrink_idle_seconds,
+                event_dispatcher=self._event_dispatcher,
             )
 
         self._leak: Optional[LeakDetector] = None
@@ -214,6 +229,7 @@ class ConnectionPool:
                 leak_cooldown=config.leak_cooldown,
                 force_reclaim_leaked=config.force_reclaim_leaked,
                 leak_listener=config.leak_listener,
+                event_dispatcher=self._event_dispatcher,
             )
 
         self._started = False
@@ -307,6 +323,28 @@ class ConnectionPool:
     def stats(self) -> PoolStats:
         """获取当前运行统计快照。"""
         return self._manager.snapshot_stats(waiting=self._borrow.waiting_count)
+
+    # ---------------------------------------------------------- 事件订阅
+
+    def add_event_listener(self, listener: EventListener) -> int:
+        """
+        添加一个事件监听器,返回监听器 ID(用于移除)。
+        监听器签名: def listener(event: PoolEvent) -> None
+        监听器异常完全隔离,单个监听器出错不影响连接池或其他监听器。
+        """
+        return self._event_dispatcher.add_listener(listener)
+
+    def remove_event_listener(self, listener_id: int) -> bool:
+        """根据 ID 移除事件监听器,返回是否成功。"""
+        return self._event_dispatcher.remove_listener(listener_id)
+
+    def remove_all_event_listeners(self) -> None:
+        """移除所有事件监听器。"""
+        self._event_dispatcher.remove_all_listeners()
+
+    def dispatch_event(self, event_type: PoolEventType, conn_id: Optional[int] = None, **details: Any) -> None:
+        """手动分发一个事件(通常由内部模块调用,业务侧一般不需要)。"""
+        self._event_dispatcher.dispatch(event_type, conn_id, **details)
 
     # ---------------------------------------------------------- 可观测性接口
 

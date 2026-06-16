@@ -54,6 +54,7 @@ def stats_to_dict(
             "ping_failures": getattr(stats, "ping_failures", 0),
             "reset_failures": getattr(stats, "reset_failures", 0),
             "retried_operations": getattr(stats, "retried_operations", 0),
+            "rotated_total": getattr(stats, "rotated_total", 0),
         },
         "timing": {
             "avg_wait_seconds": round(getattr(stats, "avg_wait_seconds", 0.0), 6),
@@ -142,6 +143,11 @@ def stats_to_prometheus(
         "retried_operations_total",
         getattr(stats, "retried_operations", 0),
         "Total retried operations (create/ping/reset)",
+    )
+    _counter(
+        "rotated_total",
+        getattr(stats, "rotated_total", 0),
+        "Total connections rotated due to max_borrow_count or max_age_for_rotation",
     )
 
     # Timing 作为 gauge 输出(滑动窗口统计)

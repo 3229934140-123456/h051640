@@ -43,6 +43,7 @@ from typing import Deque, Optional, Tuple
 from .connection import PooledConnection
 from .connection_factory import ConnectionFactory
 from .pool_manager import PoolManager
+from .events import EventDispatcher, PoolEventType
 
 
 logger = logging.getLogger("db_pool.borrow")
@@ -68,12 +69,18 @@ class BorrowReturn:
         borrow_timeout: float = 8.0,
         test_on_borrow: bool = True,
         capture_stack_on_borrow: bool = False,
+        max_borrow_count: int = 0,
+        max_age_for_rotation: float = 0.0,
+        event_dispatcher: Optional[EventDispatcher] = None,
     ) -> None:
         self._manager = manager
         self._factory = factory
         self._borrow_timeout = borrow_timeout
         self._test_on_borrow = test_on_borrow
         self._capture_stack = capture_stack_on_borrow
+        self._max_borrow_count = max_borrow_count
+        self._max_age_for_rotation = max_age_for_rotation
+        self._events = event_dispatcher
 
         self._lock = manager.acquire_lock()
         self._cond = threading.Condition(self._lock)
@@ -100,7 +107,17 @@ class BorrowReturn:
             wait_start = time.monotonic()
 
             # --- Phase A: 锁内决定获取方式 (idle / 创建名额 / 排队) ---
-            kind, candidate = self._acquire_slot_locked(deadline, effective_timeout)
+            try:
+                kind, candidate = self._acquire_slot_locked(deadline, effective_timeout)
+            except GetTimeoutError as exc:
+                # 超时事件
+                if self._events is not None:
+                    self._events.dispatch(
+                        PoolEventType.WAIT_TIMEOUT,
+                        timeout=effective_timeout,
+                        detail=str(exc),
+                    )
+                raise
 
             # 记录等待耗时 (从进入 borrow 到拿到候选)
             wait_time = time.monotonic() - wait_start
@@ -117,10 +134,23 @@ class BorrowReturn:
                         self._wake_one_locked()
                     continue
                 candidate = new_conn
+                # 创建事件
+                if self._events is not None:
+                    self._events.dispatch(
+                        PoolEventType.CONNECTION_CREATED,
+                        conn_id=candidate.conn_id,
+                        is_new=True,
+                    )
 
             # --- Phase B: 锁外健康校验 (candidate 一定不是 None) ---
             if not self._validate_out_of_lock(candidate):
                 # 使用 manager.destroy_connection 确保 destroyed 统计被正确更新
+                if self._events is not None:
+                    self._events.dispatch(
+                        PoolEventType.CONNECTION_DESTROYED,
+                        conn_id=candidate.conn_id,
+                        reason="ping_failed",
+                    )
                 self._manager.destroy_connection(candidate)
                 with self._cond:
                     if kind == _TAKE_CREATE:
@@ -131,9 +161,23 @@ class BorrowReturn:
             # --- Phase C: 锁内完成登记 ---
             final = self._register_borrowed_locked(candidate, kind)
             if final is not None:
+                # 借出事件
+                if self._events is not None:
+                    self._events.dispatch(
+                        PoolEventType.CONNECTION_BORROWED,
+                        conn_id=final.conn_id,
+                        borrow_count=final.borrow_count,
+                        wait_seconds=wait_time,
+                    )
                 return final
             # final 为 None → 中途 shutdown, 销毁 candidate 继续
             # 使用 manager.destroy_connection 确保 destroyed 统计被正确更新
+            if self._events is not None:
+                self._events.dispatch(
+                    PoolEventType.CONNECTION_DESTROYED,
+                    conn_id=candidate.conn_id,
+                    reason="shutdown_during_borrow",
+                )
             self._manager.destroy_connection(candidate)
 
     # ------------------------------------------------------------------
@@ -243,8 +287,9 @@ class BorrowReturn:
         1) 锁内从 borrowed 注销
         2) 锁外从旧 PooledConnection 剥离真实连接
         3) 锁外 reset 真实连接
-        4) 锁外用真实连接创建新的 PooledConnection 包装
-        5) 锁内判断入池或销毁
+        4) 检查轮换条件(年龄/使用次数),超限则销毁重建
+        5) 锁外用真实连接创建新的 PooledConnection 包装
+        6) 锁内判断入池或销毁
         """
         if conn is None:
             return
@@ -259,9 +304,22 @@ class BorrowReturn:
                 )
                 return
             conn.mark_returned()
+            is_shutdown = self._manager.is_shutdown
+
+        # 触发归还事件 (在锁外)
+        if self._events is not None:
+            self._events.dispatch(
+                PoolEventType.CONNECTION_RETURNED,
+                conn_id=conn.conn_id,
+                is_shutdown=is_shutdown,
+            )
+        if is_shutdown:
+            self._events.dispatch(PoolEventType.SHUTDOWN_RETURN, conn_id=conn.conn_id) if self._events else None
 
         # 2) 锁外剥离真实连接 (旧包装对象永久失效)
         old_conn_id = conn.conn_id
+        old_borrow_count = conn.borrow_count
+        old_age_seconds = conn.age_seconds
         real_conn = conn.strip_real_connection()
         if real_conn is None:
             logger.warning(
@@ -276,19 +334,69 @@ class BorrowReturn:
         reset_ok = self._factory.reset_real(real_conn, old_conn_id)
         if not reset_ok:
             # 注意: reset_failures 由 ConnectionFactory 通过 stats_callback 报告
+            if self._events is not None:
+                self._events.dispatch(
+                    PoolEventType.RESET_FAILED,
+                    conn_id=old_conn_id,
+                )
+            # 销毁路径 1: reset 失败 - 必须统计 destroyed
             self._factory.destroy_real(real_conn)
             with self._cond:
+                self._manager._stats.destroyed += 1
                 self._wake_one_locked()
             return
 
-        # 4) 锁外用真实连接创建新的 PooledConnection 包装
-        #    注意: 这里不持锁,但创建新 PooledConnection 只是内存操作很快
-        new_pooled = self._factory.wrap_real(real_conn, self._manager._pool_ref)
+        # 4) 检查轮换条件: 借还次数超限 或 年龄超限
+        needs_rotation = False
+        rotation_reason = ""
+        if self._max_borrow_count > 0 and old_borrow_count >= self._max_borrow_count:
+            needs_rotation = True
+            rotation_reason = f"borrow_count={old_borrow_count} >= max={self._max_borrow_count}"
+        elif self._max_age_for_rotation > 0 and old_age_seconds >= self._max_age_for_rotation:
+            needs_rotation = True
+            rotation_reason = f"age={old_age_seconds:.1f}s >= max={self._max_age_for_rotation}s"
 
-        # 5) 锁内决定去向 + 唤醒
+        new_pooled = None
+        if needs_rotation:
+            # 轮换: 销毁旧连接,创建新连接
+            if self._events is not None:
+                self._events.dispatch(
+                    PoolEventType.CONNECTION_ROTATED,
+                    conn_id=old_conn_id,
+                    reason=rotation_reason,
+                    borrow_count=old_borrow_count,
+                    age_seconds=old_age_seconds,
+                )
+            self._manager.inc_rotated()
+            # 销毁路径 2: 轮换 - 必须统计 destroyed
+            self._factory.destroy_real(real_conn)
+            with self._cond:
+                self._manager._stats.destroyed += 1
+            # 尝试创建新连接替换 (锁外创建,不阻塞)
+            try:
+                new_pooled = self._factory.create(self._manager._pool_ref)
+                with self._cond:
+                    self._manager._stats.created += 1
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Rotate connection failed to create new one: %s", exc)
+                with self._cond:
+                    self._wake_one_locked()
+                return
+        else:
+            # 5) 锁外用真实连接创建新的 PooledConnection 包装
+            #    注意: 继承旧连接的 borrow_count,这样轮换判断是基于真实连接的总使用次数
+            new_pooled = self._factory.wrap_real(
+                real_conn,
+                self._manager._pool_ref,
+                borrow_count=old_borrow_count,
+            )
+
+        # 6) 锁内决定去向 + 唤醒
         with self._cond:
             if self._manager.is_shutdown:
-                self._factory.destroy_real(real_conn)
+                # 销毁路径 3: 关闭中归还 - 必须统计 destroyed
+                self._factory.destroy_real(new_pooled._peek_real_connection() if new_pooled else real_conn)
+                self._manager._stats.destroyed += 1
                 self._wake_one_locked()
                 return
 
@@ -299,8 +407,15 @@ class BorrowReturn:
                 + self._manager.in_health_check_count
             )
             if total >= self._manager._max_size:
-                # 动态缩容后的超额连接
-                self._factory.destroy_real(real_conn)
+                # 销毁路径 4: 动态缩容后的超额连接 - 必须统计 destroyed
+                if self._events is not None:
+                    self._events.dispatch(
+                        PoolEventType.SHRINK_DISCARDED,
+                        conn_id=old_conn_id,
+                        reason=f"total={total} >= max={self._manager._max_size}",
+                    )
+                self._factory.destroy_real(new_pooled._peek_real_connection() if new_pooled else real_conn)
+                self._manager._stats.destroyed += 1
                 self._wake_one_locked()
                 return
 

@@ -24,6 +24,7 @@ from .leak_detector import LeakInfo, LeakListener
 from .retry import RetryPolicy, RetryOutcome, NO_RETRY
 from .shutdown_state import ShutdownInfo, ShutdownPhase, ShutdownState
 from .metrics import stats_to_dict, stats_to_json, stats_to_prometheus
+from .events import EventDispatcher, PoolEvent, PoolEventType, EventListener
 
 __all__ = [
     "ConnectionPool",
@@ -42,8 +43,12 @@ __all__ = [
     "ShutdownInfo",
     "ShutdownPhase",
     "ShutdownState",
+    "EventDispatcher",
+    "PoolEvent",
+    "PoolEventType",
+    "EventListener",
     "stats_to_dict",
     "stats_to_json",
     "stats_to_prometheus",
 ]
-__version__ = "2.0.0"
+__version__ = "2.1.0"
