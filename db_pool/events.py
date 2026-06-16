@@ -32,9 +32,10 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, Deque, List, Optional
 
 
 logger = logging.getLogger("db_pool.events")
@@ -57,6 +58,11 @@ class PoolEventType(str, Enum):
     RESET_FAILED = "reset_failed"
     SHUTDOWN_RETURN = "shutdown_return"
 
+    POOL_PAUSED = "pool_paused"
+    POOL_RESUMED = "pool_resumed"
+    POOL_RESIZED = "pool_resized"
+    HEALTH_CHECK_TRIGGERED = "health_check_triggered"
+
 
 @dataclass
 class PoolEvent:
@@ -78,20 +84,24 @@ EventListener = Callable[[PoolEvent], None]
 
 class EventDispatcher:
     """
-    线程安全的事件分发器。
+    线程安全的事件分发器 + 历史事件环形缓冲区。
 
     设计要点:
     - 监听器异常完全隔离: 每个监听器调用都包 try-catch
     - 分发事件时不持锁,避免监听器阻塞其他线程
     - 支持动态添加/移除监听器
+    - 环形缓冲区保存最近 N 条事件,支持审计回放
     """
 
-    def __init__(self, pool_name: str = "default") -> None:
+    def __init__(self, pool_name: str = "default", history_size: int = 200) -> None:
         self._pool_name = pool_name
         self._lock = threading.RLock()
         self._listeners: List[EventListener] = []
         self._listener_ids: dict[int, EventListener] = {}
         self._next_id = 0
+        # 环形历史缓冲区
+        self._history: Deque[PoolEvent] = deque(maxlen=history_size)
+        self._history_size = history_size
 
     def add_listener(self, listener: EventListener) -> int:
         """
@@ -132,27 +142,27 @@ class EventDispatcher:
         **details: Any,
     ) -> None:
         """
-        分发一个事件给所有监听器。
+        分发一个事件给所有监听器,并存入历史环形缓冲区。
 
         异常隔离:
         - 每个监听器独立 try-catch
         - 单个监听器异常打 warning 日志,不影响其他监听器
         - 分发过程绝不抛出异常给调用方
         """
-        # 先持锁拿到监听器快照,然后在锁外分发
-        # 这样即使监听器执行时间很长,也不会阻塞 add/remove
-        with self._lock:
-            listeners = list(self._listeners)
-
-        if not listeners:
-            return
-
         event = PoolEvent(
             type=event_type,
             conn_id=conn_id,
             pool_name=self._pool_name,
             details=dict(details),
         )
+
+        # 存入历史环 (持锁,保证与查询历史的线程安全)
+        with self._lock:
+            self._history.append(event)
+            listeners = list(self._listeners)
+
+        if not listeners:
+            return
 
         for listener in listeners:
             try:
@@ -165,3 +175,45 @@ class EventDispatcher:
                     exc,
                     exc_info=True,
                 )
+
+    # ---------------------------------------------------------- 历史回放
+
+    @property
+    def history_size(self) -> int:
+        """历史环形缓冲区的容量。"""
+        return self._history_size
+
+    @property
+    def history_count(self) -> int:
+        """当前历史缓冲区中的事件数。"""
+        with self._lock:
+            return len(self._history)
+
+    def get_history(
+        self,
+        event_type: Optional[PoolEventType] = None,
+        limit: Optional[int] = None,
+    ) -> List[PoolEvent]:
+        """
+        查询历史事件(从新到旧)。
+
+        :param event_type: 按事件类型过滤,None 表示返回所有类型
+        :param limit: 最多返回多少条,None 表示返回全部(不超过 history_size)
+        :return: 历史事件列表(最新的在前面)
+        """
+        with self._lock:
+            events = list(reversed(self._history))
+        if event_type is not None:
+            events = [e for e in events if e.type == event_type]
+        if limit is not None and limit > 0:
+            events = events[:limit]
+        return events
+
+    def get_recent_events(self, limit: int = 10) -> List[PoolEvent]:
+        """获取最近 N 条事件(从新到旧),等价于 get_history(limit=N)。"""
+        return self.get_history(limit=limit)
+
+    def clear_history(self) -> None:
+        """清空历史事件缓冲区。"""
+        with self._lock:
+            self._history.clear()

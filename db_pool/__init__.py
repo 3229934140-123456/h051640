@@ -19,7 +19,7 @@ from .pool import ConnectionPool, PoolConfig
 from .connection import PooledConnection, ConnectionReturnedError
 from .connection_factory import ConnectionFactory
 from .pool_manager import PoolStats
-from .borrow_return import GetTimeoutError, PoolClosedError
+from .borrow_return import GetTimeoutError, PoolClosedError, PoolPausedError
 from .leak_detector import LeakInfo, LeakListener
 from .retry import RetryPolicy, RetryOutcome, NO_RETRY
 from .shutdown_state import ShutdownInfo, ShutdownPhase, ShutdownState
@@ -34,6 +34,7 @@ __all__ = [
     "PoolStats",
     "GetTimeoutError",
     "PoolClosedError",
+    "PoolPausedError",
     "ConnectionReturnedError",
     "LeakInfo",
     "LeakListener",
@@ -51,4 +52,4 @@ __all__ = [
     "stats_to_json",
     "stats_to_prometheus",
 ]
-__version__ = "2.1.0"
+__version__ = "2.2.0"

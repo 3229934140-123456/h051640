@@ -89,7 +89,6 @@ class BorrowReturn:
         self._lock = manager.acquire_lock()
         self._cond = threading.Condition(self._lock)
         self._waiters: Deque[threading.Event] = deque()
-        self._pending_creates: int = 0
         self._paused: bool = False
 
     # ---------------------------------------------------------- 指标
@@ -107,9 +106,8 @@ class BorrowReturn:
 
     @property
     def pending_creates(self) -> int:
-        """正在创建中的连接数。"""
-        with self._cond:
-            return self._pending_creates
+        """正在创建中的连接数(与 manager 共享同一计数器)。"""
+        return self._manager.pending_creates
 
     # ---------------------------------------------------------- 暂停/恢复
 
@@ -166,7 +164,7 @@ class BorrowReturn:
                 if new_conn is None:
                     # 创建失败, 释放占坑,重新循环尝试
                     with self._cond:
-                        self._pending_creates -= 1
+                        self._manager._pending_creates = max(0, self._manager._pending_creates - 1)
                         self._wake_one_locked()
                     continue
                 candidate = new_conn
@@ -185,7 +183,7 @@ class BorrowReturn:
                 self._manager.destroy_connection(candidate, reason="ping_failed")
                 with self._cond:
                     if kind == _TAKE_CREATE:
-                        self._pending_creates -= 1
+                        self._manager._pending_creates = max(0, self._manager._pending_creates - 1)
                     self._wake_one_locked()
                 continue
 
@@ -233,11 +231,11 @@ class BorrowReturn:
                 total = (
                     self._manager.idle_count
                     + self._manager.borrowed_count
-                    + self._pending_creates
+                    + self._manager._pending_creates
                     + self._manager.in_health_check_count
                 )
                 if total < self._manager._max_size:
-                    self._pending_creates += 1
+                    self._manager._pending_creates += 1
                     return (_TAKE_CREATE, None)
 
                 # c) 排队
@@ -246,7 +244,6 @@ class BorrowReturn:
                     self._manager.inc_timeout()
                     s = self._manager.snapshot_stats(
                         waiting=len(self._waiters),
-                        pending_creates=self._pending_creates,
                     )
                     raise GetTimeoutError(
                         f"Timed out waiting for connection after "
@@ -299,7 +296,7 @@ class BorrowReturn:
         """成功登记返回连接,中途 shutdown 返回 None。"""
         with self._cond:
             if kind == _TAKE_CREATE:
-                self._pending_creates -= 1
+                self._manager._pending_creates = max(0, self._manager._pending_creates - 1)
             if self._manager.is_shutdown:
                 return None
             c.mark_borrowed(capture_stack=self._capture_stack)
@@ -413,11 +410,18 @@ class BorrowReturn:
             self._factory.destroy_real(real_conn)
             with self._cond:
                 self._manager._stats.destroyed += 1
-            # 尝试创建新连接替换 (锁外创建,不阻塞)
+            # 尝试创建新连接替换 (使用统一占坑机制, 并发安全)
+            if not self._manager.acquire_create_slot():
+                # 占不到坑就不创建了, 让后续借还时自然补充
+                with self._cond:
+                    self._wake_one_locked()
+                return
             try:
                 new_pooled = self._factory.create(self._manager._pool_ref)
                 self._manager.set_last_create_reason("rotation")
+                # 创建成功: 释放坑并统计
                 with self._cond:
+                    self._manager._pending_creates = max(0, self._manager._pending_creates - 1)
                     self._manager._stats.created += 1
                 if self._events is not None:
                     self._events.dispatch(
@@ -427,6 +431,8 @@ class BorrowReturn:
                         rotation_reason=rotation_reason,
                     )
             except Exception as exc:  # noqa: BLE001
+                # 创建失败: 释放坑
+                self._manager.release_create_slot()
                 logger.warning("Rotate connection failed to create new one: %s", exc)
                 with self._cond:
                     self._wake_one_locked()
@@ -461,7 +467,7 @@ class BorrowReturn:
             total = (
                 self._manager.idle_count
                 + self._manager.borrowed_count
-                + self._pending_creates
+                + self._manager._pending_creates
                 + self._manager.in_health_check_count
             )
             if total >= self._manager._max_size:

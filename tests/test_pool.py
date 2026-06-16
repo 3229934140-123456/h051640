@@ -1505,6 +1505,153 @@ class TestRuntimeControlStress(unittest.TestCase):
 
 
 # ==========================================================================
+# 新增功能测试: 事件历史回放 + 运维快照
+# ==========================================================================
+class TestEventHistoryAndSnapshot(unittest.TestCase):
+    """测试事件历史环和运维快照。"""
+
+    def setUp(self):
+        FakeDBConnection.reset_counter()
+
+    def test_event_history_records_all_events(self):
+        """事件历史环能记录所有事件,包括创建/销毁/轮换等。"""
+        pool = make_pool(
+            min_size=2, max_size=5,
+            max_borrow_count=2,  # 借还 2 次就轮换
+            health_check_enabled=False,
+            leak_check_enabled=False,
+        ).start()
+
+        # 预热就应该有 2 个创建事件
+        history = pool.get_event_history(event_type=PoolEventType.CONNECTION_CREATED)
+        self.assertGreaterEqual(len(history), 2)
+
+        # 借还几次，触发轮换
+        for i in range(4):
+            with pool.connection() as conn:
+                conn.cursor().execute(f"SELECT {i}")
+
+        # 应该有借出、归还、轮换、销毁、新的创建等事件
+        all_events = pool.get_event_history()
+        self.assertGreater(len(all_events), 0)
+
+        # 验证可以按类型过滤
+        created_events = pool.get_event_history(event_type=PoolEventType.CONNECTION_CREATED)
+        destroyed_events = pool.get_event_history(event_type=PoolEventType.CONNECTION_DESTROYED)
+        rotated_events = pool.get_event_history(event_type=PoolEventType.CONNECTION_ROTATED)
+
+        self.assertGreater(len(created_events), 0)
+        self.assertGreater(len(destroyed_events), 0)
+        self.assertGreater(len(rotated_events), 0)
+
+        # get_recent_events 限制数量
+        recent = pool.get_recent_events(limit=3)
+        self.assertLessEqual(len(recent), 3)
+
+        pool.close()
+
+    def test_control_events_are_recorded(self):
+        """暂停/恢复/调参/主动健康检查这些控制动作也会产生事件。"""
+        pool = make_pool(
+            min_size=2, max_size=5,
+            health_check_enabled=True,
+            check_interval=60.0,  # 不自动跑
+            leak_check_enabled=False,
+        ).start()
+
+        # 暂停
+        pool.pause_borrow()
+        paused_events = pool.get_event_history(event_type=PoolEventType.POOL_PAUSED)
+        self.assertEqual(len(paused_events), 1)
+
+        # 恢复
+        pool.resume_borrow()
+        resumed_events = pool.get_event_history(event_type=PoolEventType.POOL_RESUMED)
+        self.assertEqual(len(resumed_events), 1)
+
+        # 调参
+        pool.resize(new_max=8, new_min=3)
+        resized_events = pool.get_event_history(event_type=PoolEventType.POOL_RESIZED)
+        self.assertEqual(len(resized_events), 1)
+        self.assertEqual(resized_events[0].details.get("new_max"), 8)
+        self.assertEqual(resized_events[0].details.get("new_min"), 3)
+
+        # 主动健康检查
+        triggered = pool.trigger_health_check()
+        self.assertTrue(triggered)
+        trigger_events = pool.get_event_history(event_type=PoolEventType.HEALTH_CHECK_TRIGGERED)
+        self.assertGreaterEqual(len(trigger_events), 1)
+
+        pool.close()
+
+    def test_inspection_snapshot(self):
+        """运维快照包含所有关键信息。"""
+        pool = make_pool(
+            min_size=2, max_size=5,
+            health_check_enabled=False,
+            leak_check_enabled=False,
+            pool_name="test-pool",
+        ).start()
+
+        snap = pool.get_inspection_snapshot()
+
+        # 基本信息
+        self.assertEqual(snap["pool_name"], "test-pool")
+        self.assertIn("snapshot_timestamp", snap)
+        self.assertFalse(snap["is_closed"])
+        self.assertFalse(snap["is_paused"])
+
+        # 配置
+        self.assertEqual(snap["config"]["min_size"], 2)
+        self.assertEqual(snap["config"]["max_size"], 5)
+
+        # 容量
+        self.assertIn("total", snap["capacity"])
+        self.assertIn("idle", snap["capacity"])
+        self.assertIn("borrowed", snap["capacity"])
+        self.assertIn("pending_creates", snap["capacity"])
+        self.assertIn("in_health_check", snap["capacity"])
+        self.assertIn("waiting", snap["capacity"])
+        self.assertIn("usage_ratio", snap["capacity"])
+
+        # 累计统计
+        self.assertIn("created_total", snap["cumulative"])
+        self.assertIn("destroyed_total", snap["cumulative"])
+        self.assertIn("borrowed_total", snap["cumulative"])
+        self.assertIn("rotated_total", snap["cumulative"])
+
+        # 最近事件原因
+        self.assertIn("last_create_reason", snap["last_events"])
+        self.assertIn("last_destroy_reason", snap["last_events"])
+        self.assertIn("last_rotation_reason", snap["last_events"])
+
+        # 等待耗时
+        self.assertIn("avg_wait_seconds", snap["wait_stats"])
+        self.assertIn("p99_wait_seconds", snap["wait_stats"])
+        self.assertIn("max_wait_seconds", snap["wait_stats"])
+
+        # 最近事件列表
+        self.assertIsInstance(snap["recent_events"], list)
+        self.assertGreater(len(snap["recent_events"]), 0)  # 预热有创建事件
+
+        pool.close()
+
+    def test_pool_paused_error_from_public_import(self):
+        """PoolPausedError 可以从 db_pool 包直接导入。"""
+        # 验证公开入口可用
+        from db_pool import PoolPausedError
+        self.assertTrue(issubclass(PoolPausedError, RuntimeError))
+
+        pool = make_pool(min_size=1, max_size=2).start()
+        pool.pause_borrow()
+
+        with self.assertRaises(PoolPausedError):
+            pool.acquire(timeout=0.1)
+
+        pool.close()
+
+
+# ==========================================================================
 # main
 # ==========================================================================
 def run_demo():
@@ -1590,13 +1737,44 @@ def run_demo():
     print(f"    leaks_reported conn_ids: {leaks_reported}")
     leaked.close()
 
-    # 示例4: resize
+    # 示例5: resize
     print("\n[5] resize min_size 3 -> 5 ...")
     pool.resize(new_min=5)
     print(f"    resize 后: {pool}")
 
-    # 示例5: 关闭
-    print("\n[6] 优雅关闭(等待所有连接归还)...")
+    # 示例6: 暂停/恢复借出
+    print("\n[6] 演示暂停 / 恢复借出 ...")
+    pool.pause_borrow()
+    print(f"    暂停后 is_paused = {pool.is_paused}")
+    try:
+        pool.acquire(timeout=0.1)
+    except PoolPausedError as e:
+        print(f"    再借会抛 PoolPausedError: {e}")
+    pool.resume_borrow()
+    print(f"    恢复后 is_paused = {pool.is_paused}")
+
+    # 示例7: 事件历史(审计回放)
+    print("\n[7] 演示事件历史回放(最近 5 条) ...")
+    recent = pool.get_recent_events(limit=5)
+    for i, evt in enumerate(recent):
+        print(f"    [{i}] {evt.type.value} | conn_id={evt.conn_id} | details={evt.details}")
+
+    # 示例8: 运维巡检快照
+    print("\n[8] 演示运维巡检快照 ...")
+    snap = pool.get_inspection_snapshot()
+    print(f"    池名: {snap['pool_name']}")
+    print(f"    状态: closed={snap['is_closed']}, paused={snap['is_paused']}")
+    print(f"    容量: total={snap['capacity']['total']}, "
+          f"idle={snap['capacity']['idle']}, "
+          f"borrowed={snap['capacity']['borrowed']}, "
+          f"pending={snap['capacity']['pending_creates']}")
+    print(f"    使用率: {snap['capacity']['usage_ratio']:.1%}")
+    print(f"    累计创建: {snap['cumulative']['created_total']}, "
+          f"累计销毁: {snap['cumulative']['destroyed_total']}")
+    print(f"    快照中最近事件数: {len(snap['recent_events'])}")
+
+    # 示例9: 关闭
+    print("\n[9] 优雅关闭(等待所有连接归还)...")
     pool.close(graceful=True, wait_timeout=3)
     print(f"    关闭后: {pool}")
     print("\nDemo 完成.\n")

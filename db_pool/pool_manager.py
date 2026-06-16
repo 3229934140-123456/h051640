@@ -116,6 +116,9 @@ class PoolManager:
         # 健康检查从 idle 移走的连接数 (用于计算 total 时要加上,守住 max_size
         self._in_health_check: int = 0
 
+        # 正在创建中的连接数 (所有创建路径统一占坑, 确保不突破 max_size)
+        self._pending_creates: int = 0
+
         # 等待耗时统计 (滑动窗口 60s / 2000 样本
         self._wait_stats = TimeWindowStats(window_seconds=60.0, max_samples=2000)
 
@@ -135,9 +138,9 @@ class PoolManager:
 
     @property
     def total_count(self) -> int:
-        """总连接数 = 空闲 + 已借出 + 健康检查正在探活的。"""
+        """总连接数 = 空闲 + 已借出 + 健康检查中 + 创建中。"""
         with self._lock:
-            return len(self._idle) + len(self._borrowed) + self._in_health_check
+            return len(self._idle) + len(self._borrowed) + self._in_health_check + self._pending_creates
 
     @property
     def idle_count(self) -> int:
@@ -155,11 +158,16 @@ class PoolManager:
             return self._in_health_check
 
     @property
-    def can_create_more(self) -> bool:
-        """创建名额是否还有?考虑 idle+borrowed+in_health_check 都不能超过 max_size。
-        """
+    def pending_creates(self) -> int:
+        """正在创建中的连接数(所有创建路径统一占坑)。"""
         with self._lock:
-            total = len(self._idle) + len(self._borrowed) + self._in_health_check
+            return self._pending_creates
+
+    @property
+    def can_create_more(self) -> bool:
+        """创建名额是否还有?考虑 idle+borrowed+in_health_check+pending_creates 都不能超过 max_size。"""
+        with self._lock:
+            total = len(self._idle) + len(self._borrowed) + self._in_health_check + self._pending_creates
             return total < self._max_size
 
     # ---------------------------------------------------------- 初始化预热
@@ -265,23 +273,44 @@ class PoolManager:
 
     # ---------------------------------------------------------- 创建 / 销毁
 
+    # ---------------------------------------------------------- 创建占坑机制
+
+    def acquire_create_slot(self) -> bool:
+        """
+        尝试占一个创建坑。成功返回 True,失败返回 False。
+        占坑后 pending_creates 会 +1,确保并发创建时不突破 max_size。
+        创建完成或失败后,必须调用 release_create_slot() 来释放坑。
+        """
+        with self._lock:
+            total = len(self._idle) + len(self._borrowed) + self._in_health_check + self._pending_creates
+            if total >= self._max_size:
+                return False
+            self._pending_creates += 1
+            return True
+
+    def release_create_slot(self) -> None:
+        """释放一个创建坑。创建完成或失败时都要调用。"""
+        with self._lock:
+            self._pending_creates = max(0, self._pending_creates - 1)
+
     def try_create_one(self, reason: str = "manual") -> Optional[PooledConnection]:
         """
         若尚未达 max_size,创建一个新连接并计入统计。
-        否则返回 None。
+        否则返回 None。使用统一的占坑机制确保并发安全。
         :param reason: 创建原因,用于事件和 last_create_reason 统计
         """
-        with self._lock:
-            total = len(self._idle) + len(self._borrowed) + self._in_health_check
-            if total >= self._max_size:
-                return None
+        if not self.acquire_create_slot():
+            return None
         try:
             conn = self._factory.create(self._pool_ref)
         except Exception as exc:  # noqa: BLE001
+            self.release_create_slot()
             logger.warning("Failed to create new connection: %s", exc)
             # 注意: create_failures 由 ConnectionFactory 通过 stats_callback 报告
             return None
+        # 创建成功: 释放坑并计入正式统计
         with self._lock:
+            self._pending_creates = max(0, self._pending_creates - 1)
             self._stats.created += 1
             self._stats.last_create_reason = reason
         if self._events is not None:
@@ -380,12 +409,14 @@ class PoolManager:
         """记录一次等待耗时,由借还模块在拿到连接后调用。"""
         self._wait_stats.record(wait_seconds)
 
-    def snapshot_stats(self, waiting: int = 0, pending_creates: int = 0) -> PoolStats:
+    def snapshot_stats(self, waiting: int = 0, pending_creates: Optional[int] = None) -> PoolStats:
         with self._lock:
+            pc = pending_creates if pending_creates is not None else self._pending_creates
+            total = len(self._idle) + len(self._borrowed) + self._in_health_check + pc
             s = PoolStats(
                 min_size=self._stats.min_size,
                 max_size=self._stats.max_size,
-                total=len(self._idle) + len(self._borrowed) + self._in_health_check,
+                total=total,
                 idle=len(self._idle),
                 borrowed=len(self._borrowed),
                 waiting=waiting,
@@ -402,7 +433,7 @@ class PoolManager:
                 last_create_reason=self._stats.last_create_reason,
                 last_destroy_reason=self._stats.last_destroy_reason,
                 last_rotation_reason=self._stats.last_rotation_reason,
-                pending_creates=pending_creates,
+                pending_creates=pc,
                 in_health_check=self._in_health_check,
                 avg_wait_seconds=self._wait_stats.avg(),
                 p99_wait_seconds=self._wait_stats.p99(),

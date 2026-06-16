@@ -32,9 +32,10 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterator, Optional, TYPE_CHECKING
+from typing import Any, Callable, Iterator, List, Optional, TYPE_CHECKING
 
 from .connection import ConnectionReturnedError, PooledConnection
 from .connection_factory import ConnectionFactory
@@ -332,6 +333,11 @@ class ConnectionPool:
             logger.warning("Pool is closed, ignore pause_borrow")
             return
         self._borrow.pause()
+        if self._event_dispatcher is not None:
+            self._event_dispatcher.dispatch(
+                PoolEventType.POOL_PAUSED,
+                reason="manual",
+            )
         logger.info("Connection pool borrowing paused")
 
     def resume_borrow(self) -> None:
@@ -340,6 +346,11 @@ class ConnectionPool:
             logger.warning("Pool is closed, ignore resume_borrow")
             return
         self._borrow.resume()
+        if self._event_dispatcher is not None:
+            self._event_dispatcher.dispatch(
+                PoolEventType.POOL_RESUMED,
+                reason="manual",
+            )
         logger.info("Connection pool borrowing resumed")
 
     def trigger_health_check(self) -> bool:
@@ -353,6 +364,11 @@ class ConnectionPool:
         if self._health is None:
             return False
         self._health.trigger_check()
+        if self._event_dispatcher is not None:
+            self._event_dispatcher.dispatch(
+                PoolEventType.HEALTH_CHECK_TRIGGERED,
+                reason="manual",
+            )
         return True
 
     def resize(self, new_min: Optional[int] = None, new_max: Optional[int] = None) -> None:
@@ -363,7 +379,16 @@ class ConnectionPool:
         if self.is_closed:
             logger.warning("Pool is closed, ignore resize")
             return
+        old_min, old_max = self._manager.min_size, self._manager.max_size
         self._manager.resize(new_min=new_min, new_max=new_max)
+        if self._event_dispatcher is not None:
+            self._event_dispatcher.dispatch(
+                PoolEventType.POOL_RESIZED,
+                old_min=old_min,
+                old_max=old_max,
+                new_min=self._manager.min_size,
+                new_max=self._manager.max_size,
+            )
         if self._health is not None:
             self._health.trigger_check()
 
@@ -371,7 +396,6 @@ class ConnectionPool:
         """获取当前运行统计快照。"""
         return self._manager.snapshot_stats(
             waiting=self._borrow.waiting_count,
-            pending_creates=self._borrow.pending_creates,
         )
 
     # ---------------------------------------------------------- 事件订阅
@@ -395,6 +419,26 @@ class ConnectionPool:
     def dispatch_event(self, event_type: PoolEventType, conn_id: Optional[int] = None, **details: Any) -> None:
         """手动分发一个事件(通常由内部模块调用,业务侧一般不需要)。"""
         self._event_dispatcher.dispatch(event_type, conn_id, **details)
+
+    # ---------------------------------------------------------- 事件历史(审计回放)
+
+    def get_event_history(
+        self,
+        event_type: Optional[PoolEventType] = None,
+        limit: Optional[int] = None,
+    ) -> List[PoolEvent]:
+        """
+        查询历史事件(从新到旧),用于问题排查和审计回放。
+
+        :param event_type: 按事件类型过滤,None 表示返回所有类型
+        :param limit: 最多返回多少条,None 表示返回全部(受 history_size 限制)
+        :return: 历史事件列表(最新的在前面)
+        """
+        return self._event_dispatcher.get_history(event_type=event_type, limit=limit)
+
+    def get_recent_events(self, limit: int = 10) -> List[PoolEvent]:
+        """获取最近 N 条事件(从新到旧),快捷方法。"""
+        return self._event_dispatcher.get_recent_events(limit=limit)
 
     # ---------------------------------------------------------- 可观测性接口
 
@@ -425,6 +469,96 @@ class ConnectionPool:
         return self._shutdown_state.snapshot(
             borrowed_count=self._manager.borrowed_count,
         )
+
+    # ---------------------------------------------------------- 运维巡检快照
+
+    def get_inspection_snapshot(self, recent_events_limit: int = 10) -> dict:
+        """
+        获取运维视图的完整快照,适合巡检或故障排查时一次性拉取所有信息。
+
+        包含:
+        - 池标识与配置摘要
+        - 当前运行状态(暂停/关闭等)
+        - 容量与水位指标
+        - 累计统计
+        - 最近事件摘要
+        """
+        stats = self.stats()
+        cfg = self._config
+
+        # 配置摘要(只挑关键的运维参数)
+        config_summary = {
+            "min_size": cfg.min_size,
+            "max_size": cfg.max_size,
+            "borrow_timeout": cfg.borrow_timeout,
+            "test_on_borrow": cfg.test_on_borrow,
+            "health_check_enabled": cfg.health_check_enabled,
+            "check_interval": cfg.check_interval if cfg.health_check_enabled else None,
+            "max_lifetime": cfg.max_lifetime,
+            "enable_shrink": cfg.enable_shrink,
+            "shrink_idle_seconds": cfg.shrink_idle_seconds if cfg.enable_shrink else None,
+            "leak_check_enabled": cfg.leak_check_enabled,
+            "leak_threshold_seconds": cfg.leak_threshold if cfg.leak_check_enabled else None,
+            "max_borrow_count": cfg.max_borrow_count,
+            "max_age_for_rotation": cfg.max_age_for_rotation,
+        }
+
+        # 容量水位
+        capacity = {
+            "total": stats.total,
+            "idle": stats.idle,
+            "borrowed": stats.borrowed,
+            "pending_creates": stats.pending_creates,
+            "in_health_check": stats.in_health_check,
+            "waiting": stats.waiting,
+            "usage_ratio": round(stats.borrowed / cfg.max_size, 3) if cfg.max_size > 0 else 0,
+        }
+
+        # 累计统计
+        cumulative = {
+            "created_total": stats.created,
+            "destroyed_total": stats.destroyed,
+            "borrowed_total": stats.borrowed_total,
+            "timeouts_total": stats.timeouts,
+            "leaked_total": stats.leaked,
+            "create_failures": stats.create_failures,
+            "ping_failures": stats.ping_failures,
+            "reset_failures": stats.reset_failures,
+            "rotated_total": stats.rotated_total,
+            "retried_operations": stats.retried_operations,
+        }
+
+        # 最近事件摘要
+        recent_events = [
+            {
+                "type": e.type.value,
+                "timestamp": e.timestamp,
+                "conn_id": e.conn_id,
+                "details": e.details,
+            }
+            for e in self.get_recent_events(limit=recent_events_limit)
+        ]
+
+        return {
+            "pool_name": cfg.pool_name,
+            "snapshot_timestamp": time.time(),
+            "is_closed": self.is_closed,
+            "is_paused": self.is_paused,
+            "config": config_summary,
+            "capacity": capacity,
+            "cumulative": cumulative,
+            "last_events": {
+                "last_create_reason": stats.last_create_reason,
+                "last_destroy_reason": stats.last_destroy_reason,
+                "last_rotation_reason": stats.last_rotation_reason,
+            },
+            "wait_stats": {
+                "avg_wait_seconds": round(stats.avg_wait_seconds, 4),
+                "p99_wait_seconds": round(stats.p99_wait_seconds, 4),
+                "max_wait_seconds": round(stats.max_wait_seconds, 4),
+            },
+            "recent_events": recent_events,
+        }
 
     # ---------------------------------------------------------- 关闭
 
